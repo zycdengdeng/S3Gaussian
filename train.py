@@ -471,9 +471,9 @@ def scene_reconstruction(dataset, opt, hyper, pipe, testing_iterations, saving_i
             # Log and save
             timer.pause()
             # training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, [pipe, background], stage)
-            # if (iteration in saving_iterations):
-            #     print("\n[ITER {}] Saving Gaussians".format(iteration))
-            #     scene.save(iteration, stage)
+            if (iteration in saving_iterations):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration, stage)
             if dataset.render_process:
                 if (iteration < 10000 and iteration % 1000 == 999) \
                     or (iteration < 30000 and iteration % 2000 == 1999) \
