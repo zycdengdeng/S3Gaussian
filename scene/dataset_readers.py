@@ -1093,10 +1093,423 @@ def readWaymoInfo(path, white_background, eval, extension=".png", use_bg_gs=Fals
     return scene_info
 
 
+def readRoadsideInfo(path, white_background, eval, extension=".png", use_bg_gs=False,
+                     load_sky_mask=False, load_panoptic_mask=False, load_sam_mask=False,
+                     load_dynamic_mask=False, load_feat_map=False,
+                     load_intrinsic=False, load_c2w=False,
+                     start_time=0, end_time=-1, num_pts=5000,
+                     save_occ_grid=False, occ_voxel_size=0.4, recompute_occ_grid=True,
+                     stride=0, original_start_time=0):
+    """
+    Read roadside infrastructure dataset.
+
+    Key differences from Waymo loader:
+    - Configurable number of cameras (reads from frame_info.json)
+    - No OPENCV2DATASET coordinate transform (extrinsics are already camera-to-world)
+    - Supports single-frame static scene reconstruction
+    - LiDAR bin format: Nx10 same as Waymo (origins[3] + points[3] + unused[3] + laser_id[1])
+    """
+    data_root = path
+    # Load frame_info.json for roadside-specific metadata
+    frame_info_path = os.path.join(data_root, "frame_info.json")
+    with open(frame_info_path, 'r') as f:
+        frame_info = json.load(f)
+
+    num_cameras = frame_info.get("num_cameras", 4)
+    original_sizes = frame_info.get("original_sizes", [[1080, 1920]] * num_cameras)
+    # Ensure original_sizes has correct length
+    while len(original_sizes) < num_cameras:
+        original_sizes.append(original_sizes[-1])
+
+    camera_list = list(range(num_cameras))
+
+    # Determine load_size from first available image
+    image_folder = os.path.join(data_root, "images")
+    sample_imgs = sorted([f for f in os.listdir(image_folder) if f.endswith(('.jpg', '.png'))])
+    if sample_imgs:
+        sample_img = Image.open(os.path.join(image_folder, sample_imgs[0]))
+        orig_w, orig_h = sample_img.size
+        # Use actual image size (roadside images may not be 1920x1280 like Waymo)
+        load_size = [orig_h, orig_w]  # [height, width]
+        # Set original_sizes from actual image for consistent intrinsic scaling
+        for i in range(num_cameras):
+            original_sizes[i] = [orig_h, orig_w]
+    else:
+        load_size = [original_sizes[0][0], original_sizes[0][1]]
+
+    print(f"[Roadside] num_cameras={num_cameras}, load_size={load_size}")
+
+    # Determine number of frames
+    num_seqs = len(sample_imgs) // num_cameras
+    if num_seqs == 0:
+        num_seqs = 1
+    start_time = start_time
+    if end_time == -1:
+        end_time = int(num_seqs)
+    else:
+        end_time = min(end_time + 1, num_seqs)
+    print(f"[Roadside] frames: {start_time} -> {end_time} (total {end_time - start_time})")
+
+    truncated_min_range, truncated_max_range = -80, 80
+    cam_frustum_range = [0.01, 80]
+
+    # Build file path lists
+    img_filepaths = []
+    sky_mask_filepaths, dynamic_mask_filepaths = [], []
+    semantic_mask_filepaths, instance_mask_filepaths = [], []
+    sam_mask_filepaths, feat_map_filepaths = [], []
+    lidar_filepaths = []
+
+    for t in range(start_time, end_time):
+        for cam_idx in camera_list:
+            # Try jpg first, then png
+            jpg_path = os.path.join(data_root, "images", f"{t:03d}_{cam_idx}.jpg")
+            png_path = os.path.join(data_root, "images", f"{t:03d}_{cam_idx}.png")
+            if os.path.exists(jpg_path):
+                img_filepaths.append(jpg_path)
+            elif os.path.exists(png_path):
+                img_filepaths.append(png_path)
+            else:
+                img_filepaths.append(jpg_path)  # will fail gracefully later
+
+            sky_mask_filepaths.append(os.path.join(data_root, "sky_masks", f"{t:03d}_{cam_idx}.png"))
+
+            if os.path.exists(os.path.join(data_root, "semantic_segs", f"{t:03d}_{cam_idx}.npy")):
+                semantic_mask_filepaths.append(os.path.join(data_root, "semantic_segs", f"{t:03d}_{cam_idx}.npy"))
+            else:
+                semantic_mask_filepaths.append(None)
+            if os.path.exists(os.path.join(data_root, "instance_segs", f"{t:03d}_{cam_idx}.npy")):
+                instance_mask_filepaths.append(os.path.join(data_root, "instance_segs", f"{t:03d}_{cam_idx}.npy"))
+            else:
+                instance_mask_filepaths.append(None)
+            if os.path.exists(os.path.join(data_root, "sam_masks", f"{t:03d}_{cam_idx}.jpg")):
+                sam_mask_filepaths.append(os.path.join(data_root, "sam_masks", f"{t:03d}_{cam_idx}.jpg"))
+            if os.path.exists(os.path.join(data_root, "dynamic_masks", f"{t:03d}_{cam_idx}.png")):
+                dynamic_mask_filepaths.append(os.path.join(data_root, "dynamic_masks", f"{t:03d}_{cam_idx}.png"))
+            if load_feat_map:
+                feat_map_filepaths.append(os.path.join(data_root, "dinov2_vitb14", f"{t:03d}_{cam_idx}.npy"))
+        lidar_filepaths.append(os.path.join(data_root, "lidar", f"{t:03d}.bin"))
+
+    if load_feat_map:
+        return_dict = extract_and_save_features(
+            input_img_path_list=img_filepaths,
+            saved_feat_path_list=feat_map_filepaths,
+            img_shape=[load_size[0] + 4, load_size[1] + 6],  # pad for divisibility by 14
+            stride=7,
+            model_type='dinov2_vitb14',
+        )
+
+    img_filepaths = np.array(img_filepaths)
+    dynamic_mask_filepaths = np.array(dynamic_mask_filepaths)
+    sky_mask_filepaths = np.array(sky_mask_filepaths)
+    lidar_filepaths = np.array(lidar_filepaths)
+    semantic_mask_filepaths = np.array(semantic_mask_filepaths)
+    instance_mask_filepaths = np.array(instance_mask_filepaths)
+    sam_mask_filepaths = np.array(sam_mask_filepaths)
+    feat_map_filepaths = np.array(feat_map_filepaths)
+
+    # Construct timestamps
+    idx_list = range(original_start_time, end_time)
+    timestamp_mapper = {}
+    time_line = [i for i in idx_list]
+    time_length = max(end_time - original_start_time - 1, 1)  # avoid div by zero for single frame
+    for index, time in enumerate(time_line):
+        timestamp_mapper[time] = (time - original_start_time) / time_length
+    max_time = max(timestamp_mapper.values())
+
+    # Load poses: intrinsic, c2w
+    _intrinsics = []
+    cam_to_egos = []
+    for i in range(num_cameras):
+        # Load intrinsics
+        intrinsic = np.loadtxt(os.path.join(data_root, "intrinsics", f"{i}.txt"))
+        fx, fy, cx, cy = intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3]
+        # Scale intrinsics w.r.t. load size (no-op if image is already at original size)
+        fx = fx * load_size[1] / original_sizes[i][1]
+        fy = fy * load_size[0] / original_sizes[i][0]
+        cx = cx * load_size[1] / original_sizes[i][1]
+        cy = cy * load_size[0] / original_sizes[i][0]
+        intrinsic_mat = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
+        _intrinsics.append(intrinsic_mat)
+
+        # Load extrinsics (camera-to-ego/reference transform)
+        cam_to_ego = np.loadtxt(os.path.join(data_root, "extrinsics", f"{i}.txt"))
+        # For roadside: extrinsics are already camera-to-reference-frame
+        # No OPENCV2DATASET transform needed (unlike Waymo which needs coordinate conversion)
+        cam_to_egos.append(cam_to_ego)
+
+    # Compute per-image poses
+    cam_to_worlds, ego_to_worlds = [], []
+    intrinsics, cam_ids = [], []
+    lidar_to_worlds = []
+    timestamps, timesteps = [], []
+
+    ego_to_world_start = np.loadtxt(os.path.join(data_root, "ego_pose", f"{start_time:03d}.txt"))
+    for t in range(start_time, end_time):
+        ego_to_world_current = np.loadtxt(os.path.join(data_root, "ego_pose", f"{t:03d}.txt"))
+        ego_to_world = np.linalg.inv(ego_to_world_start) @ ego_to_world_current
+        ego_to_worlds.append(ego_to_world)
+        for cam_idx in camera_list:
+            cam_ids.append(cam_idx)
+            cam2world = ego_to_world @ cam_to_egos[cam_idx]
+            cam_to_worlds.append(cam2world)
+            intrinsics.append(_intrinsics[cam_idx])
+            timestamps.append(t - start_time)
+            timesteps.append(t - start_time)
+        lidar_to_worlds.append(ego_to_world)
+
+    intrinsics = np.stack(intrinsics, axis=0)
+    cam_to_worlds = np.stack(cam_to_worlds, axis=0)
+    ego_to_worlds = np.stack(ego_to_worlds, axis=0)
+    lidar_to_worlds = np.stack(lidar_to_worlds, axis=0)
+    cam_ids = np.array(cam_ids)
+    timestamps = np.array(timestamps)
+    timesteps = np.array(timesteps)
+
+    # Compute AABB from camera frustums
+    frustums = []
+    pix_corners = np.array(
+        [[0, 0], [0, load_size[0]], [load_size[1], load_size[0]], [load_size[1], 0]]
+    )
+    for c2w, intri in zip(cam_to_worlds, intrinsics):
+        frustum = []
+        for cam_extent in cam_frustum_range:
+            cam_corners = np.linalg.inv(intri) @ np.concatenate(
+                [pix_corners, np.ones((4, 1))], axis=-1
+            ).T * cam_extent
+            world_corners = c2w[:3, :3] @ cam_corners + c2w[:3, 3:4]
+            frustum.append(world_corners)
+        frustum = np.stack(frustum, axis=0)
+        frustums.append(frustum)
+    frustums = np.stack(frustums, axis=0)
+
+    aabbs = []
+    for frustum in frustums:
+        flatten_frustum = frustum.transpose(0, 2, 1).reshape(-1, 3)
+        aabb_min = np.min(flatten_frustum, axis=0)
+        aabb_max = np.max(flatten_frustum, axis=0)
+        aabb = np.stack([aabb_min, aabb_max], axis=0)
+        aabbs.append(aabb)
+    aabbs = np.stack(aabbs, axis=0).reshape(-1, 3)
+    aabb = np.stack([np.min(aabbs, axis=0), np.max(aabbs, axis=0)], axis=0)
+    print('[Roadside] cam frustum aabb min: ', aabb[0])
+    print('[Roadside] cam frustum aabb max: ', aabb[1])
+
+    # Train/test split
+    if stride != 0:
+        train_mask = (timestamps % int(stride) != 0) | (timestamps == 0)
+    else:
+        train_mask = np.ones(len(timestamps), dtype=bool)
+    test_mask = ~train_mask
+    train_idx = np.where(train_mask)[0]
+    test_idx = np.where(test_mask)[0]
+    full_idx = np.arange(len(timestamps))
+    train_timestamps = timestamps[train_mask]
+    test_timestamps = timestamps[test_mask]
+
+    # Load points and depth maps
+    pts_path = os.path.join(data_root, "lidar")
+    load_lidar, load_depthmap = True, True
+    depth_maps = None
+    bg_scale = 2.0
+    occ_grid = None
+
+    if not os.path.exists(pts_path) or not load_lidar:
+        print(f"[Roadside] Generating random point cloud ({num_pts})...")
+        aabb_center = (aabb[0] + aabb[1]) / 2
+        aabb_size = aabb[1] - aabb[0]
+        random_xyz = np.random.random((num_pts, 3))
+        xyz = random_xyz * aabb_size + aabb[0]
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+    else:
+        origins, directions, points, ranges, laser_ids = [], [], [], [], []
+        depth_maps = []
+        for t in trange(0, len(lidar_filepaths), desc="[Roadside] loading lidar", dynamic_ncols=True):
+            lidar_info = np.memmap(
+                lidar_filepaths[t], dtype=np.float32, mode="r",
+            ).reshape(-1, 10)
+            lidar_origins = lidar_info[:, :3]
+            lidar_points = lidar_info[:, 3:6]
+            lidar_ids = lidar_info[:, -1]
+
+            # For roadside, we use a wider range since the infrastructure looks in all directions
+            valid_mask = np.ones(len(lidar_points), dtype=bool)
+            # Optional: filter by range from sensor
+            point_range = np.linalg.norm(lidar_points - lidar_origins, axis=-1)
+            valid_mask = valid_mask & (point_range < truncated_max_range)
+
+            lidar_origins = lidar_origins[valid_mask]
+            lidar_points = lidar_points[valid_mask]
+            lidar_ids = lidar_ids[valid_mask]
+
+            # Transform to world coordinates
+            lidar_origins = (
+                lidar_to_worlds[t][:3, :3] @ lidar_origins.T + lidar_to_worlds[t][:3, 3:4]
+            ).T
+            lidar_points = (
+                lidar_to_worlds[t][:3, :3] @ lidar_points.T + lidar_to_worlds[t][:3, 3:4]
+            ).T
+
+            if load_depthmap:
+                for cam_idx in range(len(camera_list)):
+                    c2w = cam_to_worlds[len(camera_list) * t + cam_idx]
+                    w2c = np.linalg.inv(c2w)
+                    cam_points = (w2c[:3, :3] @ lidar_points.T + w2c[:3, 3:4]).T
+                    pixel_points = (intrinsics[len(camera_list) * t + cam_idx] @ cam_points.T).T
+                    pixel_points = pixel_points[pixel_points[:, 2] > 0]
+                    image_points = pixel_points[:, :2] / pixel_points[:, 2:]
+                    valid = (
+                        (image_points[:, 0] >= 0) & (image_points[:, 0] < load_size[1])
+                        & (image_points[:, 1] >= 0) & (image_points[:, 1] < load_size[0])
+                    )
+                    pixel_points = pixel_points[valid]
+                    image_points = image_points[valid]
+                    depth_map = np.zeros(load_size)
+                    if len(image_points) > 0:
+                        depth_map[image_points[:, 1].astype(np.int32),
+                                  image_points[:, 0].astype(np.int32)] = pixel_points[:, 2]
+                    depth_maps.append(depth_map)
+
+            lidar_directions = lidar_points - lidar_origins
+            lidar_ranges = np.linalg.norm(lidar_directions, axis=-1, keepdims=True)
+            lidar_directions = lidar_directions / (lidar_ranges + 1e-8)
+
+            origins.append(lidar_origins)
+            directions.append(lidar_directions)
+            points.append(lidar_points)
+            ranges.append(lidar_ranges)
+            laser_ids.append(lidar_ids)
+
+        points = np.concatenate(points, axis=0)
+        shs = np.random.random((len(points), 3)) / 255.0
+        # Filter by camera AABB
+        cam_aabb_mask = np.all((points >= aabb[0]) & (points <= aabb[1]), axis=-1)
+        points = points[cam_aabb_mask]
+        shs = shs[cam_aabb_mask]
+
+        if save_occ_grid:
+            if not os.path.exists(os.path.join(data_root, "occ_grid.npy")) or recompute_occ_grid:
+                occ_grid = get_OccGrid(points, aabb, occ_voxel_size)
+                np.save(os.path.join(data_root, "occ_grid.npy"), occ_grid)
+            else:
+                occ_grid = np.load(os.path.join(data_root, "occ_grid.npy"))
+            print(f'[Roadside] Lidar points: {len(points)}')
+            print(f'[Roadside] occ_grid: {occ_grid.shape}, '
+                  f'occupied: {occ_grid.sum()}/{occ_grid.size} ({occ_grid.sum()/occ_grid.size:.4f})')
+
+        # Downsample
+        points, shs = GridSample3D(points, shs)
+        if len(points) > num_pts:
+            indices = np.random.choice(len(points), num_pts, replace=False)
+            points = points[indices]
+            shs = shs[indices]
+
+        print(f"[Roadside] init points: {len(points)}, "
+              f"xyz range: [{np.min(points, axis=0)}] ~ [{np.max(points, axis=0)}]")
+
+        bg_pcd, bg_ply_path = None, None
+        if use_bg_gs:
+            fg_aabb_center = (aabb[0] + aabb[1]) / 2
+            fg_aabb_size = aabb[1] - aabb[0]
+            bg_gs_aabb = np.stack([fg_aabb_center - fg_aabb_size * bg_scale / 2,
+                                   fg_aabb_center + fg_aabb_size * bg_scale / 2], axis=0)
+            bg_aabb_center = (bg_gs_aabb[0] + bg_gs_aabb[1]) / 2
+            bg_aabb_size = bg_gs_aabb[1] - bg_gs_aabb[0]
+            bg_points = sample_on_aabb_surface(bg_aabb_center, bg_aabb_size, 1000)
+            bg_shs = np.random.random((len(bg_points), 3)) / 255.0
+            bg_ply_path = os.path.join(data_root, "ds-bg-points3d.ply")
+            storePly(bg_ply_path, bg_points, SH2RGB(bg_shs) * 255)
+            bg_pcd = BasicPointCloud(points=bg_points, colors=SH2RGB(bg_shs),
+                                     normals=np.zeros((len(bg_points), 3)))
+
+        ply_path = os.path.join(data_root, "ds-points3d.ply")
+        storePly(ply_path, points, SH2RGB(shs) * 255)
+        pcd = BasicPointCloud(points=points, colors=SH2RGB(shs), normals=np.zeros((len(points), 3)))
+
+        if load_depthmap:
+            depth_maps = np.stack(depth_maps, axis=0)
+
+    if not use_bg_gs:
+        bg_pcd, bg_ply_path = None, None
+
+    # Build frame dicts
+    train_frames_list = []
+    test_frames_list = []
+    full_frames_list = []
+
+    def _make_frame_dict(t, global_idx):
+        return dict(
+            time=time_line[t + start_time - original_start_time],
+            transform_matrix=cam_to_worlds[global_idx],
+            file_path=img_filepaths[global_idx],
+            intrinsic=intrinsics[global_idx],
+            load_size=[load_size[1], load_size[0]],  # [w, h] for PIL
+            sky_mask_path=sky_mask_filepaths[global_idx] if load_sky_mask else None,
+            depth_map=depth_maps[global_idx] if (load_depthmap and depth_maps is not None) else None,
+            semantic_mask_path=semantic_mask_filepaths[global_idx] if load_panoptic_mask else None,
+            instance_mask_path=instance_mask_filepaths[global_idx] if load_panoptic_mask else None,
+            sam_mask_path=sam_mask_filepaths[global_idx] if load_sam_mask else None,
+            feat_map_path=feat_map_filepaths[global_idx] if load_feat_map else None,
+            dynamic_mask_path=dynamic_mask_filepaths[global_idx] if load_dynamic_mask else None,
+        )
+
+    for idx, t in enumerate(train_timestamps):
+        train_frames_list.append(_make_frame_dict(t, train_idx[idx]))
+    for idx, t in enumerate(test_timestamps):
+        test_frames_list.append(_make_frame_dict(t, test_idx[idx]))
+    if len(test_timestamps) == 0:
+        full_frames_list = train_frames_list
+    else:
+        for idx, t in enumerate(timestamps):
+            full_frames_list.append(_make_frame_dict(t, full_idx[idx]))
+
+    # Build camera infos
+    print("[Roadside] Reading Training Transforms")
+    train_cam_infos = constructCameras_waymo(train_frames_list, white_background, timestamp_mapper,
+                                             load_intrinsic=load_intrinsic, load_c2w=load_c2w,
+                                             start_time=start_time, original_start_time=original_start_time)
+    print("[Roadside] Reading Test Transforms")
+    test_cam_infos = constructCameras_waymo(test_frames_list, white_background, timestamp_mapper,
+                                            load_intrinsic=load_intrinsic, load_c2w=load_c2w,
+                                            start_time=start_time, original_start_time=original_start_time)
+    print("[Roadside] Reading Full Transforms")
+    full_cam_infos = constructCameras_waymo(full_frames_list, white_background, timestamp_mapper,
+                                            load_intrinsic=load_intrinsic, load_c2w=load_c2w,
+                                            start_time=start_time, original_start_time=original_start_time)
+
+    if not eval:
+        train_cam_infos.extend(test_cam_infos)
+        test_cam_infos = []
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    num_panoptic_objects = 0
+    panoptic_object_ids = None
+    panoptic_id_to_idx = {}
+
+    scene_info = SceneInfo(
+        point_cloud=pcd,
+        bg_point_cloud=bg_pcd,
+        train_cameras=train_cam_infos,
+        test_cameras=test_cam_infos,
+        full_cameras=full_cam_infos,
+        nerf_normalization=nerf_normalization,
+        ply_path=pts_path,
+        bg_ply_path=bg_ply_path,
+        cam_frustum_aabb=aabb,
+        num_panoptic_objects=num_panoptic_objects,
+        panoptic_object_ids=panoptic_object_ids,
+        panoptic_id_to_idx=panoptic_id_to_idx,
+        occ_grid=occ_grid if save_occ_grid else None,
+    )
+    return scene_info
+
+
 sceneLoadTypeCallbacks = {
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "Waymo" : readWaymoInfo,
+    "Roadside": readRoadsideInfo,
 }
 
 def GridSample3D(in_pc,in_shs, voxel_size=0.013):

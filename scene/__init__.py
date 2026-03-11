@@ -51,12 +51,40 @@ class Scene:
         self.test_cameras = {}
         self.full_cameras = {}
 
+        # Detect dataset type
+        _is_roadside = False
+        if os.path.exists(os.path.join(args.source_path, "frame_info.json")):
+            with open(os.path.join(args.source_path, "frame_info.json"), 'r') as _f:
+                _frame_info = json.load(_f)
+                _is_roadside = _frame_info.get("scene_type") == "roadside"
+
         if os.path.exists(os.path.join(args.source_path, "sparse")):
             #scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval)
             scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.object_path, n_views=args.n_views, random_init=args.random_init, train_split=args.train_split)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval)
+        elif _is_roadside:
+            print("Found roadside frame_info.json, assuming Roadside data set!")
+            scene_info = sceneLoadTypeCallbacks["Roadside"](args.source_path, args.white_background, args.eval,
+                                    use_bg_gs = bg_gaussians is not None,
+                                    load_sky_mask = args.load_sky_mask,
+                                    load_panoptic_mask = args.load_panoptic_mask,
+                                    load_intrinsic = args.load_intrinsic,
+                                    load_c2w = args.load_c2w,
+                                    load_sam_mask = args.load_sam_mask,
+                                    load_dynamic_mask = args.load_dynamic_mask,
+                                    load_feat_map = args.load_feat_map,
+                                    start_time = args.start_time,
+                                    end_time = args.end_time,
+                                    num_pts = args.num_pts,
+                                    save_occ_grid = args.save_occ_grid,
+                                    occ_voxel_size = args.occ_voxel_size,
+                                    recompute_occ_grid = args.recompute_occ_grid,
+                                    stride = args.stride,
+                                    original_start_time = args.original_start_time,
+                                    )
+            dataset_type="roadside"
         elif os.path.exists(os.path.join(args.source_path,"frame_info.json")):
             print("Found frame_info.json file, assuming Waymo data set!")
             scene_info = sceneLoadTypeCallbacks["Waymo"](args.source_path, args.white_background, args.eval,
