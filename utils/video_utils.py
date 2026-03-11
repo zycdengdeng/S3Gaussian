@@ -203,7 +203,7 @@ def render_func(
             # ------------- flow ------------- #
             if "dx" in render_pkg and render_pkg['dx'] is not None:
                 dx = render_pkg['dx']
-                dx = torch.tensor(dx)
+                dx = dx.clone().detach() if isinstance(dx, torch.Tensor) else torch.tensor(dx)
                 dx_max = torch.max(dx)
                 dx_min = torch.min(dx)
                 dx_list.append(dx)     
@@ -220,7 +220,8 @@ def render_func(
                 )
                 lpipss.append(torch.tensor(lpips(rgb, gt_rgb,net_type='alex')).mean().item())
                 
-                dynamic_mask = get_numpy(viewpoint_cam.dynamic_mask).astype(bool)
+                has_dynamic_mask = viewpoint_cam.dynamic_mask is not None
+                dynamic_mask = get_numpy(viewpoint_cam.dynamic_mask).astype(bool) if has_dynamic_mask else np.zeros((rgb.shape[1], rgb.shape[2]), dtype=bool)
                 if dynamic_mask.sum() > 0:
                     rgb_d = rgb.permute(1, 2, 0)[dynamic_mask]
                     rgb_d = rgb_d.permute(1, 0)
