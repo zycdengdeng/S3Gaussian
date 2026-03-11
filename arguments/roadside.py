@@ -31,6 +31,11 @@ ModelParams = dict(
     recompute_occ_grid=False,
 )
 
+ModelHiddenParams = dict(
+    # Disable DINOv2 feature head (no feat_map available for roadside)
+    feat_head=False,
+)
+
 OptimizationParams = dict(
     # For single-frame static scene, fewer iterations may suffice
     coarse_iterations=3000,
