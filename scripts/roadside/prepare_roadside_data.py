@@ -286,7 +286,7 @@ def detect_layout(scene_dir):
     """
     Detect input data layout.
 
-    Returns: "self_dataset" or "car_road"
+    Returns: "self_dataset", "car_road", or "support_info"
     """
     # self_Dataset layout: scene_dir/img/pinhole0/...
     if os.path.exists(os.path.join(scene_dir, "img")):
@@ -294,7 +294,10 @@ def detect_layout(scene_dir):
     # car_road layout: scene_dir/road/cameras/pinhole0/...
     if os.path.exists(os.path.join(scene_dir, "road", "cameras")):
         return "car_road"
-    # Fallback: check for calib.json + img at top level
+    # support_info layout: scene_dir/support_info/calib.json + pinhole{N}/ at top level
+    if os.path.exists(os.path.join(scene_dir, "support_info", "calib.json")):
+        return "support_info"
+    # Fallback: check for calib.json at top level
     if os.path.exists(os.path.join(scene_dir, "calib.json")):
         return "self_dataset"
     return "unknown"
@@ -304,6 +307,7 @@ def find_calib_json(scene_dir, layout):
     """Auto-detect calib.json location."""
     candidates = [
         os.path.join(scene_dir, "calib.json"),
+        os.path.join(scene_dir, "support_info", "calib.json"),
         os.path.join(scene_dir, "road", "calib.json"),
         os.path.join(scene_dir, "road", "calib", "calib.json"),
         os.path.join(scene_dir, "calib", "calib.json"),
