@@ -23,13 +23,13 @@ def main():
      _features_dc, _features_rest, _scaling, _rotation, _opacity,
      max_radii2D, xyz_gradient_accum, denom, opt_dict, spatial_lr_scale) = model_params
 
-    xyz = _xyz.numpy()
+    xyz = _xyz.detach().numpy()
     normals = np.zeros_like(xyz)
-    f_dc = _features_dc.transpose(1, 2).flatten(start_dim=1).contiguous().numpy()
-    f_rest = _features_rest.transpose(1, 2).flatten(start_dim=1).contiguous().numpy()
-    opacities = _opacity.numpy()
-    scale = _scaling.numpy()
-    rotation = _rotation.numpy()
+    f_dc = _features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().numpy()
+    f_rest = _features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().numpy()
+    opacities = _opacity.detach().numpy()
+    scale = _scaling.detach().numpy()
+    rotation = _rotation.detach().numpy()
 
     # Build attribute names
     attr_names = ['x', 'y', 'z', 'nx', 'ny', 'nz']
