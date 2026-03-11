@@ -5,24 +5,28 @@
 转换为 S3Gaussian 所需的 Waymo 目录格式。
 
 支持两种输入布局:
-  A) self_Dataset/ 布局 (单场景):
+  A) car_road 布局 (天津数据集等):
+       data_root/
+         support_info/calib.json          # 所有场景共享的标定文件
+         {scene_name}/road/cameras/pinhole{0-3}/cam{N}_{timestamp}.png
+         {scene_name}/road/lidar/merged_pcd/{timestamp}.pcd
+       --scene_dir 指向具体场景文件夹, calib.json 会自动从父目录搜索
+
+  B) self_Dataset/ 布局 (单场景):
        calib.json, {timestamp}.pcd, img/pinhole{0-3}/{timestamp}.png
-  B) car_road 布局 (多场景):
-       scene_dir/road/cameras/pinhole{0-3}/cam{N}_{timestamp}.png
-       scene_dir/road/lidar/merged_pcd/{timestamp}.pcd
-       + 独立 calib.json
 
 用法:
+    # 天津数据集 (car_road 布局, calib.json 自动从父目录搜索)
     python scripts/roadside/prepare_roadside_data.py \
-        --scene_dir /path/to/self_Dataset \
+        --scene_dir /mnt/car_road_data_TianJin/001_car0325_road0327_t1 \
         --output_dir ./data/roadside/scene_001 \
-        --timestamp 1743583131842
+        --timestamp 1742877031036
 
-    # 或指定 calib.json 路径和自定义相机映射
+    # 或手动指定 calib.json
     python scripts/roadside/prepare_roadside_data.py \
-        --scene_dir /mnt/car_road_data_fix/001_car0325_road0327_t1 \
+        --scene_dir /mnt/car_road_data_TianJin/001_car0325_road0327_t1 \
         --output_dir ./data/roadside/scene_001 \
-        --calib_json /path/to/calib.json \
+        --calib_json /mnt/car_road_data_TianJin/support_info/calib.json \
         --timestamp 1742877031036
 """
 
@@ -63,17 +67,16 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # car_road layout (calib.json auto-detected from parent dir)
+  python scripts/roadside/prepare_roadside_data.py \\
+      --scene_dir /mnt/car_road_data_TianJin/001_car0325_road0327_t1 \\
+      --output_dir ./data/roadside/scene_001 \\
+      --timestamp 1742877031036
+
   # self_Dataset layout
   python scripts/roadside/prepare_roadside_data.py \\
       --scene_dir /path/to/self_Dataset \\
       --output_dir ./data/roadside/scene_001
-
-  # car_road layout with explicit calib
-  python scripts/roadside/prepare_roadside_data.py \\
-      --scene_dir /mnt/car_road_data_fix/001_car0325_road0327_t1 \\
-      --output_dir ./data/roadside/scene_001 \\
-      --calib_json /path/to/calib.json \\
-      --timestamp 1742877031036
         """)
     parser.add_argument("--scene_dir", type=str, required=True,
                         help="Path to scene folder")
@@ -304,13 +307,20 @@ def detect_layout(scene_dir):
 
 
 def find_calib_json(scene_dir, layout):
-    """Auto-detect calib.json location."""
+    """Auto-detect calib.json location.
+
+    Searches in scene_dir and its parent directory (for shared calib files).
+    """
+    parent_dir = os.path.dirname(os.path.abspath(scene_dir))
     candidates = [
         os.path.join(scene_dir, "calib.json"),
         os.path.join(scene_dir, "support_info", "calib.json"),
         os.path.join(scene_dir, "road", "calib.json"),
         os.path.join(scene_dir, "road", "calib", "calib.json"),
         os.path.join(scene_dir, "calib", "calib.json"),
+        # Also search parent directory (calib shared across scenes)
+        os.path.join(parent_dir, "support_info", "calib.json"),
+        os.path.join(parent_dir, "calib.json"),
     ]
     for c in candidates:
         if os.path.exists(c):
