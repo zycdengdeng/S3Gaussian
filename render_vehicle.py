@@ -202,7 +202,10 @@ def create_vehicle_minicam(R_stored, T_stored, fovx, fovy, width, height, time_v
 
 
 def load_trained_model(model_path, iteration, hyper_args):
-    """Load a trained S3Gaussian model (PLY + deformation network).
+    """Load a trained S3Gaussian model from checkpoint.
+
+    Loads from chkpnt_fine_{iteration}.pth which contains the full model state
+    (point cloud + deformation network), without needing to set up an optimizer.
 
     Args:
         model_path: path to the model output directory
@@ -224,21 +227,42 @@ def load_trained_model(model_path, iteration, hyper_args):
 
     gaussians = GaussianModel(sh_degree, hyper_args)
 
-    # Load point cloud
-    ply_path = os.path.join(
-        model_path, "point_cloud", f"iteration_{iteration}", "point_cloud.ply"
-    )
-    print(f"Loading PLY from {ply_path}")
-    gaussians.load_ply(ply_path)
+    # Load from full checkpoint (chkpnt_fine_XXXXX.pth)
+    chkpnt_path = os.path.join(model_path, f"chkpnt_fine_{iteration}.pth")
+    print(f"Loading checkpoint from {chkpnt_path}")
+    (model_params, _saved_iter) = torch.load(chkpnt_path, map_location="cuda")
 
-    # Load deformation network
-    deform_path = os.path.join(
-        model_path, "point_cloud", f"iteration_{iteration}"
-    )
-    print(f"Loading deformation from {deform_path}")
-    gaussians.load_model(deform_path)
+    # Unpack model state (same order as GaussianModel.capture())
+    (active_sh_degree,
+     xyz,
+     deform_state,
+     deformation_table,
+     features_dc,
+     features_rest,
+     scaling,
+     rotation,
+     opacity,
+     max_radii2D,
+     _xyz_gradient_accum,
+     _denom,
+     _opt_dict,
+     spatial_lr_scale) = model_params
+
+    gaussians.active_sh_degree = active_sh_degree
+    gaussians._xyz = torch.nn.Parameter(xyz)
+    gaussians._features_dc = torch.nn.Parameter(features_dc)
+    gaussians._features_rest = torch.nn.Parameter(features_rest)
+    gaussians._scaling = torch.nn.Parameter(scaling)
+    gaussians._rotation = torch.nn.Parameter(rotation)
+    gaussians._opacity = torch.nn.Parameter(opacity)
+    gaussians.max_radii2D = max_radii2D
+    gaussians.spatial_lr_scale = spatial_lr_scale
+    gaussians._deformation_table = deformation_table
+    gaussians._deformation.load_state_dict(deform_state, strict=False)
+    gaussians._deformation = gaussians._deformation.to("cuda")
 
     gaussians._deformation.eval()
+    print(f"Model loaded: {gaussians._xyz.shape[0]} points, sh_degree={active_sh_degree}")
     return gaussians
 
 
