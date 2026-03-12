@@ -387,18 +387,18 @@ if __name__ == "__main__":
 
     pipe = pipeline_params.extract(args)
     hyper = hyper_params.extract(args)
-    output_dir = args.output_dir or args.model_path
+    output_dir = getattr(args, 'output_dir', None) or args.model_path
 
     render_vehicle_cameras(
         model_path=args.model_path,
         vehicle_calib=args.vehicle_calib,
         transform_json=args.transform_json,
         timestamp_ms=args.timestamp,
-        camera_ids=args.camera_ids,
+        camera_ids=getattr(args, 'camera_ids', [1, 2, 3, 4, 5, 6, 7]),
         pipe=pipe,
         hyper_args=hyper,
         output_dir=output_dir,
-        render_scale=args.render_scale,
-        iteration=args.iteration,
-        time_val=args.time,
+        render_scale=getattr(args, 'render_scale', 4),
+        iteration=getattr(args, 'iteration', 30000),
+        time_val=getattr(args, 'time', 0.0),
     )
