@@ -19,6 +19,11 @@
 # ============================================================
 set -e
 
+# Ensure we run from the project root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+cd "$PROJECT_ROOT"
+
 GPU_ID=${1:-0}
 DATA_ROOT=${2:?"Usage: $0 <GPU_ID> <DATA_ROOT> [OUTPUT_ROOT]"}
 OUTPUT_ROOT=${3:-""}
