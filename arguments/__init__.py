@@ -55,6 +55,7 @@ class ModelParams(ParamGroup):
         self._white_background = False
         self.data_device = "cuda"
         self.eval = True
+        self.object_path = "object_mask"
         # test/ train split
         self.stride = 0
         # visual
