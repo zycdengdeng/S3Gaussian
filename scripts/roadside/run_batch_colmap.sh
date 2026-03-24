@@ -3,20 +3,19 @@
 # S3Gaussian 批量训练脚本 — COLMAP → Roadside 格式转换 + 并行训练
 #
 # 不修改源数据，转换结果输出到独立目录（图片用 symlink）
-# 支持多GPU并行，每GPU可跑多个任务
+# 每张GPU独占一个训练任务，多GPU并行
 #
 # 用法:
-#   bash scripts/roadside/run_batch_colmap.sh <DATA_ROOT> [WORK_DIR] [GPUS] [PER_GPU]
+#   bash scripts/roadside/run_batch_colmap.sh <DATA_ROOT> [WORK_DIR] [GPUS]
 #
 # 参数:
 #   DATA_ROOT  - 源数据目录 (必须)
 #   WORK_DIR   - 输出目录 (默认: /mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap)
-#   GPUS       - 使用的GPU列表，逗号分隔 (默认: 0,1,2,3,4,5)
-#   PER_GPU    - 每GPU并行数 (默认: 3)
+#   GPUS       - 使用的GPU列表，逗号分隔 (默认: 0,1,2)
 #
 # 示例:
 #   bash scripts/roadside/run_batch_colmap.sh /mnt/zyc_wzh/SparseGS/data/car_road
-#   bash scripts/roadside/run_batch_colmap.sh /mnt/zyc_wzh/SparseGS/data/car_road "" "0,1,2,3,4,5" 3
+#   bash scripts/roadside/run_batch_colmap.sh /mnt/zyc_wzh/SparseGS/data/car_road "" "0,1,2"
 # ============================================================
 set -e
 
@@ -24,15 +23,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-DATA_ROOT=${1:?"Usage: $0 <DATA_ROOT> [WORK_DIR] [GPUS] [PER_GPU]"}
+DATA_ROOT=${1:?"Usage: $0 <DATA_ROOT> [WORK_DIR] [GPUS]"}
 WORK_DIR=${2:-"/mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap"}
-GPU_LIST=${3:-"0,1,2,3,4,5"}
-PER_GPU=${4:-3}
+GPU_LIST=${3:-"0,1,2"}
 
 # Parse GPU list
 IFS=',' read -ra GPUS <<< "$GPU_LIST"
 NUM_GPUS=${#GPUS[@]}
-TOTAL_SLOTS=$((NUM_GPUS * PER_GPU))
 
 # Converted data goes here (symlinks to source images, no copy)
 CONVERTED_ROOT="${WORK_DIR}/data"
@@ -44,7 +41,7 @@ mkdir -p "$LOG_DIR"
 
 echo "=========================================="
 echo " S3Gaussian Batch Training (COLMAP → Roadside)"
-echo " GPUs: ${GPU_LIST} (${NUM_GPUS} GPUs × ${PER_GPU}/GPU = ${TOTAL_SLOTS} parallel)"
+echo " GPUs: ${GPU_LIST} (${NUM_GPUS} parallel)"
 echo " Source data: ${DATA_ROOT}"
 echo " Converted data: ${CONVERTED_ROOT}"
 echo " Model output: ${MODEL_ROOT}"
@@ -76,115 +73,103 @@ done
 
 total=${#scenes[@]}
 echo ""
-echo "Found ${total} scenes to train (${TOTAL_SLOTS} parallel slots)"
+echo "Found ${total} scenes to train (${NUM_GPUS} GPUs parallel)"
 
 if [ "$total" -eq 0 ]; then
     echo "All scenes already trained or no scenes found."
     exit 0
 fi
 
-# Step 3: Launch parallel training
-# Use a job-slot approach: maintain up to TOTAL_SLOTS concurrent jobs
-# Each job gets assigned to a GPU in round-robin fashion
+# Step 3: Split scenes across GPUs, each GPU runs its share sequentially
+# GPU 0 gets scenes 0, 3, 6, ...
+# GPU 1 gets scenes 1, 4, 7, ...
+# GPU 2 gets scenes 2, 5, 8, ...
 
-train_one() {
-    local scene_dir="$1"
-    local gpu_id="$2"
-    local scene_name
-    scene_name=$(basename "$scene_dir")
-    local model_path="${MODEL_ROOT}/${scene_name}"
-    local log_file="${LOG_DIR}/${scene_name}.log"
+run_gpu_batch() {
+    local gpu_id="$1"
+    shift
+    local gpu_scenes=("$@")
+    local gpu_total=${#gpu_scenes[@]}
+    local gpu_failed=0
+    local gpu_done=0
 
-    mkdir -p "$model_path"
+    for scene_dir in "${gpu_scenes[@]}"; do
+        scene_name=$(basename "$scene_dir")
+        model_path="${MODEL_ROOT}/${scene_name}"
+        log_file="${LOG_DIR}/${scene_name}.log"
+        gpu_done=$((gpu_done + 1))
 
-    echo "[GPU ${gpu_id}] START: ${scene_name}"
+        # Double-check skip (in case another GPU finished it)
+        if [ -f "${model_path}/chkpnt_fine_30000.pth" ]; then
+            echo "[GPU ${gpu_id}] SKIP (${gpu_done}/${gpu_total}): ${scene_name}"
+            continue
+        fi
 
-    CUDA_VISIBLE_DEVICES=${gpu_id} python train.py \
-        -s "$scene_dir" \
-        --model_path "$model_path" \
-        --expname "roadside" \
-        --configs "$CONFIG" \
-        > "$log_file" 2>&1
+        mkdir -p "$model_path"
+        echo "[GPU ${gpu_id}] START (${gpu_done}/${gpu_total}): ${scene_name}"
 
-    local status=$?
-    if [ $status -eq 0 ]; then
-        echo "[GPU ${gpu_id}] DONE: ${scene_name}"
-    else
-        echo "[GPU ${gpu_id}] FAILED: ${scene_name} (see ${log_file})"
-    fi
-    return $status
-}
-
-# Track PIDs and their scene names for final summary
-declare -A pid_scene
-declare -A pid_gpu
-active_pids=()
-slot_idx=0
-failed=0
-done_count=0
-
-# Function to wait for a free slot
-wait_for_slot() {
-    while [ ${#active_pids[@]} -ge $TOTAL_SLOTS ]; do
-        # Wait for any one child to finish
-        local new_active=()
-        local found_done=false
-        for pid in "${active_pids[@]}"; do
-            if ! kill -0 "$pid" 2>/dev/null; then
-                # Process finished
-                wait "$pid" || {
-                    echo "  FAILED: ${pid_scene[$pid]}"
-                    failed=$((failed + 1))
-                }
-                done_count=$((done_count + 1))
-                unset pid_scene[$pid]
-                unset pid_gpu[$pid]
-                found_done=true
-            else
-                new_active+=("$pid")
-            fi
-        done
-        active_pids=("${new_active[@]}")
-        if ! $found_done; then
-            sleep 2
+        if CUDA_VISIBLE_DEVICES=${gpu_id} python train.py \
+            -s "$scene_dir" \
+            --model_path "$model_path" \
+            --expname "roadside" \
+            --configs "$CONFIG" \
+            > "$log_file" 2>&1; then
+            echo "[GPU ${gpu_id}] DONE (${gpu_done}/${gpu_total}): ${scene_name}"
+        else
+            echo "[GPU ${gpu_id}] FAILED (${gpu_done}/${gpu_total}): ${scene_name} (see ${log_file})"
+            gpu_failed=$((gpu_failed + 1))
         fi
     done
+
+    return $gpu_failed
 }
 
-echo ""
-echo "Launching ${total} training jobs across ${TOTAL_SLOTS} slots..."
-echo ""
-
-for scene_dir in "${scenes[@]}"; do
-    wait_for_slot
-
-    # Assign GPU round-robin
-    gpu_idx=$((slot_idx % NUM_GPUS))
-    gpu_id=${GPUS[$gpu_idx]}
-    slot_idx=$((slot_idx + 1))
-
-    train_one "$scene_dir" "$gpu_id" &
-    pid=$!
-    active_pids+=("$pid")
-    pid_scene[$pid]=$(basename "$scene_dir")
-    pid_gpu[$pid]=$gpu_id
+# Distribute scenes to GPUs round-robin
+declare -a gpu_scene_lists
+for i in $(seq 0 $((NUM_GPUS - 1))); do
+    gpu_scene_lists[$i]=""
 done
 
-# Wait for all remaining jobs
+for i in "${!scenes[@]}"; do
+    gpu_idx=$((i % NUM_GPUS))
+    gpu_scene_lists[$gpu_idx]+="${scenes[$i]}"$'\n'
+done
+
+# Launch one background process per GPU
 echo ""
-echo "Waiting for remaining ${#active_pids[@]} jobs to finish..."
-for pid in "${active_pids[@]}"; do
-    wait "$pid" || {
-        echo "  FAILED: ${pid_scene[$pid]}"
-        failed=$((failed + 1))
-    }
-    done_count=$((done_count + 1))
+echo "Launching ${NUM_GPUS} GPU workers..."
+echo ""
+
+pids=()
+for gpu_idx in $(seq 0 $((NUM_GPUS - 1))); do
+    gpu_id=${GPUS[$gpu_idx]}
+    # Parse newline-separated scene list into array
+    IFS=$'\n' read -ra gpu_scenes <<< "${gpu_scene_lists[$gpu_idx]}"
+    # Remove empty entries
+    clean_scenes=()
+    for s in "${gpu_scenes[@]}"; do
+        [ -n "$s" ] && clean_scenes+=("$s")
+    done
+
+    if [ ${#clean_scenes[@]} -eq 0 ]; then
+        continue
+    fi
+
+    echo "[GPU ${gpu_id}] Assigned ${#clean_scenes[@]} scenes"
+    run_gpu_batch "$gpu_id" "${clean_scenes[@]}" &
+    pids+=($!)
+done
+
+# Wait for all GPU workers
+failed=0
+for pid in "${pids[@]}"; do
+    wait "$pid" || failed=$((failed + $?))
 done
 
 echo ""
 echo "=========================================="
 echo " Batch training complete!"
-echo " Total: ${total}, Succeeded: $((total - failed)), Failed: ${failed}"
+echo " Total: ${total}, Failed: ${failed}"
 echo " Results: ${MODEL_ROOT}/"
 echo " Logs: ${LOG_DIR}/"
 echo "=========================================="
