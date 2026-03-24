@@ -283,7 +283,8 @@ def readColmapSceneInfo(path, images, eval, object_path, llffhold=8, n_views=100
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           full_cameras=cam_infos)
     return scene_info
 
 def readCamerasFromTransforms(path, transformsfile, white_background, extension=".png"):
@@ -361,7 +362,8 @@ def readNerfSyntheticInfo(path, white_background, eval, extension=".png"):
                            train_cameras=train_cam_infos,
                            test_cameras=test_cam_infos,
                            nerf_normalization=nerf_normalization,
-                           ply_path=ply_path)
+                           ply_path=ply_path,
+                           full_cameras=train_cam_infos + test_cam_infos)
     return scene_info
 
 def constructCameras_waymo(frames_list, white_background, mapper = {},
