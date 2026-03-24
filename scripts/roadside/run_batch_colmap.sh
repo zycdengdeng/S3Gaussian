@@ -12,11 +12,11 @@
 #   GPU_ID     - 使用的GPU编号 (必须)
 #   DATA_ROOT  - 源数据目录 (必须)
 #   WORK_DIR   - 输出目录 (默认: /mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap)
-#   PARALLEL   - 同时跑几个任务 (默认: 3)
+#   PARALLEL   - 同时跑几个任务 (默认: 6)
 #
 # 示例:
 #   bash scripts/roadside/run_batch_colmap.sh 3 /mnt/zyc_wzh/SparseGS/data/car_road
-#   bash scripts/roadside/run_batch_colmap.sh 3 /mnt/zyc_wzh/SparseGS/data/car_road "" 3
+#   bash scripts/roadside/run_batch_colmap.sh 3 /mnt/zyc_wzh/SparseGS/data/car_road "" 6
 # ============================================================
 set -e
 
@@ -27,7 +27,7 @@ cd "$PROJECT_ROOT"
 GPU_ID=${1:?"Usage: $0 <GPU_ID> <DATA_ROOT> [WORK_DIR] [PARALLEL]"}
 DATA_ROOT=${2:?"Usage: $0 <GPU_ID> <DATA_ROOT> [WORK_DIR] [PARALLEL]"}
 WORK_DIR=${3:-"/mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap"}
-PARALLEL=${4:-3}
+PARALLEL=${4:-6}
 
 CONVERTED_ROOT="${WORK_DIR}/data"
 MODEL_ROOT="${WORK_DIR}/models"
