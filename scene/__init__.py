@@ -154,7 +154,10 @@ class Scene:
                 self.bg_gaussians.create_from_pcd(scene_info.bg_point_cloud, self.cameras_extent)
 
         self.gaussians.aabb = scene_info.cam_frustum_aabb
-        self.gaussians.aabb_tensor = torch.tensor(scene_info.cam_frustum_aabb, dtype=torch.float32).cuda()
+        if scene_info.cam_frustum_aabb is not None:
+            self.gaussians.aabb_tensor = torch.tensor(scene_info.cam_frustum_aabb, dtype=torch.float32).cuda()
+        else:
+            self.gaussians.aabb_tensor = None
         self.gaussians.nerf_normalization = scene_info.nerf_normalization
         self.gaussians.img_width = scene_info.train_cameras[0].width
         self.gaussians.img_height = scene_info.train_cameras[0].height
