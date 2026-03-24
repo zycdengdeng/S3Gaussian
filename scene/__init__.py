@@ -155,8 +155,8 @@ class Scene:
                 self.bg_gaussians.create_from_pcd(scene_info.bg_point_cloud, self.cameras_extent)
 
         # Compute AABB from point cloud if not provided (e.g. COLMAP data)
-        if scene_info.cam_frustum_aabb is not None:
-            cam_frustum_aabb = scene_info.cam_frustum_aabb
+        if cam_frustum_aabb is not None:
+            cam_frustum_aabb = cam_frustum_aabb
         else:
             pts = scene_info.point_cloud.points
             pad = (pts.max(axis=0) - pts.min(axis=0)) * 0.1  # 10% padding
@@ -173,7 +173,7 @@ class Scene:
         self.gaussians.occ_voxel_size = args.occ_voxel_size
         # check occ
         #import numpy as np
-        #voxel_coords = np.floor((self.gaussians._xyz.cpu().detach().numpy() - scene_info.cam_frustum_aabb[0]) / args.occ_voxel_size).astype(int)
+        #voxel_coords = np.floor((self.gaussians._xyz.cpu().detach().numpy() - cam_frustum_aabb[0]) / args.occ_voxel_size).astype(int)
         #occ = scene_info.occ_grid[voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]]
         #occ_mask = self.gaussians.get_gs_mask_in_occGrid()
         #assert all(occ == occ_mask), 'occ should be equal to occ_mask'
@@ -183,15 +183,15 @@ class Scene:
             self.gaussians.panoptic_id_to_idx = scene_info.panoptic_id_to_idx
         # for deformation-field
         if hasattr(self.gaussians, '_deformation'):
-            self.gaussians._deformation.deformation_net.set_aabb(scene_info.cam_frustum_aabb[1],
-                                                scene_info.cam_frustum_aabb[0])
+            self.gaussians._deformation.deformation_net.set_aabb(cam_frustum_aabb[1],
+                                                cam_frustum_aabb[0])
         ## make one-hot gt label
         #gt_label = F.one_hot(torch.arange(self.gaussians.num_panoptic_objects)).float().cuda()
         ## set as nn.Embedding
         #self.gaussians.gt_label = torch.nn.Embedding.from_pretrained(gt_label, freeze=True)
         if build_octree:
             # forward : point cloud -> octree
-            self.gaussians.build_octree(aabb= scene_info.cam_frustum_aabb, # use camera-extent aabb
+            self.gaussians.build_octree(aabb= cam_frustum_aabb, # use camera-extent aabb
                                         resolution=5, threshold=10)
             if replace_pcd_by_octree_center:
                 self.gaussians.replace_pcd_by_octree_node()
@@ -203,10 +203,10 @@ class Scene:
             assert all([node.is_leaf() for node in self.node_list]), 'all nodes should be leaf nodes'
         if build_grid:
             # 建立 dense-occ-grid 来表达高斯的分布, 优势在于 索引快速
-            self.gaussians.build_grid(aabb= scene_info.cam_frustum_aabb, # use camera-extent aabb
+            self.gaussians.build_grid(aabb= cam_frustum_aabb, # use camera-extent aabb
                                     res=[128, 128, 128])
         if build_featgrid:
-            self.gaussians.build_featgrid(aabb= scene_info.cam_frustum_aabb, # use camera-extent aabb
+            self.gaussians.build_featgrid(aabb= cam_frustum_aabb, # use camera-extent aabb
                                 res=[128, 128, 128])
 
     def save(self, iteration, stage):
