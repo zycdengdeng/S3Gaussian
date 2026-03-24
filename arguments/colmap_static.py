@@ -19,10 +19,8 @@ ModelParams = dict(
     # No train/test split (use all views for training)
     stride=0,
     eval=False,
-    # Downscale large images to save GPU memory (2 = half resolution)
+    # Downscale large images (2 = half resolution)
     resolution=2,
-    # Keep images on CPU, move to GPU per-batch during training
-    data_device="cpu",
     # Disable masks not available
     load_sky_mask=False,
     load_panoptic_mask=False,

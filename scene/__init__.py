@@ -12,6 +12,7 @@
 import os
 import random
 import json
+import numpy as np
 from utils.system_utils import searchForMaxIteration
 from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
@@ -153,11 +154,15 @@ class Scene:
             if bg_gaussians is not None:
                 self.bg_gaussians.create_from_pcd(scene_info.bg_point_cloud, self.cameras_extent)
 
-        self.gaussians.aabb = scene_info.cam_frustum_aabb
+        # Compute AABB from point cloud if not provided (e.g. COLMAP data)
         if scene_info.cam_frustum_aabb is not None:
-            self.gaussians.aabb_tensor = torch.tensor(scene_info.cam_frustum_aabb, dtype=torch.float32).cuda()
+            cam_frustum_aabb = scene_info.cam_frustum_aabb
         else:
-            self.gaussians.aabb_tensor = None
+            pts = scene_info.point_cloud.points
+            pad = (pts.max(axis=0) - pts.min(axis=0)) * 0.1  # 10% padding
+            cam_frustum_aabb = np.array([pts.min(axis=0) - pad, pts.max(axis=0) + pad])
+        self.gaussians.aabb = cam_frustum_aabb
+        self.gaussians.aabb_tensor = torch.tensor(cam_frustum_aabb, dtype=torch.float32).cuda()
         self.gaussians.nerf_normalization = scene_info.nerf_normalization
         self.gaussians.img_width = scene_info.train_cameras[0].width
         self.gaussians.img_height = scene_info.train_cameras[0].height
