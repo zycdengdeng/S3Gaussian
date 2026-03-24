@@ -28,11 +28,8 @@ Usage:
 import os
 import sys
 import json
-import struct
 import argparse
 import numpy as np
-from pathlib import Path
-from collections import namedtuple
 
 # Add project root to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
@@ -42,36 +39,7 @@ from scene.colmap_loader import (
     read_extrinsics_text, read_intrinsics_text,
     read_points3D_text,
 )
-
-
-def read_points3D_binary_raw(path_to_model_file):
-    """
-    Read points3D.bin directly, handling the case where the standard
-    reader returns empty results.
-    Returns xyz (Nx3) and rgb (Nx3) arrays.
-    """
-    points3D = {}
-    with open(path_to_model_file, "rb") as fid:
-        num_points = struct.unpack("Q", fid.read(8))[0]
-        for _ in range(num_points):
-            point3D_id = struct.unpack("Q", fid.read(8))[0]
-            xyz = struct.unpack("ddd", fid.read(24))
-            rgb = struct.unpack("BBB", fid.read(3))
-            error = struct.unpack("d", fid.read(8))[0]
-            track_length = struct.unpack("Q", fid.read(8))[0]
-            track_elems = struct.unpack("ii" * track_length,
-                                        fid.read(8 * track_length))
-            points3D[point3D_id] = {
-                "xyz": np.array(xyz),
-                "rgb": np.array(rgb),
-            }
-
-    if len(points3D) == 0:
-        return np.zeros((0, 3)), np.zeros((0, 3))
-
-    xyz = np.stack([p["xyz"] for p in points3D.values()])
-    rgb = np.stack([p["rgb"] for p in points3D.values()])
-    return xyz, rgb
+from plyfile import PlyData
 
 
 def convert_scene(scene_dir, output_dir):
@@ -80,8 +48,10 @@ def convert_scene(scene_dir, output_dir):
     output_dir = os.path.abspath(output_dir)
     sparse_dir = os.path.join(scene_dir, "sparse", "0")
 
-    # Skip if already converted
-    if os.path.exists(os.path.join(output_dir, "frame_info.json")):
+    # Skip if already converted AND has non-empty lidar
+    lidar_check = os.path.join(output_dir, "lidar", "000.bin")
+    if (os.path.exists(os.path.join(output_dir, "frame_info.json"))
+            and os.path.exists(lidar_check) and os.path.getsize(lidar_check) > 0):
         print(f"  SKIP (already converted): {os.path.basename(scene_dir)}")
         return True
 
@@ -99,23 +69,28 @@ def convert_scene(scene_dir, output_dir):
         cam_extrinsics = read_extrinsics_text(os.path.join(sparse_dir, "images.txt"))
         cam_intrinsics = read_intrinsics_text(os.path.join(sparse_dir, "cameras.txt"))
 
-    # Read points3D - try standard reader first, fall back to raw reader
+    # Read points3D - try PLY first (most reliable), then bin, then txt
+    pts3d_ply = os.path.join(sparse_dir, "points3D.ply")
     pts3d_bin = os.path.join(sparse_dir, "points3D.bin")
     pts3d_txt = os.path.join(sparse_dir, "points3D.txt")
     pts3d_xyz = np.zeros((0, 3))
-    pts3d_rgb = np.zeros((0, 3))
 
-    if os.path.exists(pts3d_bin) and os.path.getsize(pts3d_bin) > 8:
+    if os.path.exists(pts3d_ply):
         try:
-            pts3d_xyz, pts3d_rgb, _ = read_points3D_binary(pts3d_bin)
-        except Exception:
-            try:
-                pts3d_xyz, pts3d_rgb = read_points3D_binary_raw(pts3d_bin)
-            except Exception as e:
-                print(f"    Warning: could not read points3D.bin: {e}")
-    elif os.path.exists(pts3d_txt):
+            plydata = PlyData.read(pts3d_ply)
+            vertices = plydata['vertex']
+            pts3d_xyz = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
+            print(f"    Read {len(pts3d_xyz)} points from points3D.ply")
+        except Exception as e:
+            print(f"    Warning: could not read points3D.ply: {e}")
+    elif os.path.exists(pts3d_bin) and os.path.getsize(pts3d_bin) > 8:
         try:
-            pts3d_xyz, pts3d_rgb, _ = read_points3D_text(pts3d_txt)
+            pts3d_xyz, _, _ = read_points3D_binary(pts3d_bin)
+        except Exception as e:
+            print(f"    Warning: could not read points3D.bin: {e}")
+    elif os.path.exists(pts3d_txt) and os.path.getsize(pts3d_txt) > 200:
+        try:
+            pts3d_xyz, _, _ = read_points3D_text(pts3d_txt)
         except Exception as e:
             print(f"    Warning: could not read points3D.txt: {e}")
 
