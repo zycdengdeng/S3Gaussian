@@ -155,8 +155,9 @@ class Scene:
                 self.bg_gaussians.create_from_pcd(scene_info.bg_point_cloud, self.cameras_extent)
 
         # Compute AABB from point cloud if not provided (e.g. COLMAP data)
+        cam_frustum_aabb = getattr(scene_info, 'cam_frustum_aabb', None)
         if cam_frustum_aabb is not None:
-            cam_frustum_aabb = cam_frustum_aabb
+            pass
         else:
             pts = scene_info.point_cloud.points
             pad = (pts.max(axis=0) - pts.min(axis=0)) * 0.1  # 10% padding
