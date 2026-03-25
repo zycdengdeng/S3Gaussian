@@ -25,11 +25,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-GPU_ID=${1:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]"}
-VEHICLE_CALIB=${2:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]"}
-TRANSFORM_ROOT=${3:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]"}
+GPU_ID=${1:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL] [--force]"}
+VEHICLE_CALIB=${2:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL] [--force]"}
+TRANSFORM_ROOT=${3:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL] [--force]"}
 WORK_DIR=${4:-"/mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap"}
 PARALLEL=${5:-6}
+FORCE=false
+# Check for --force flag in any position
+for arg in "$@"; do
+    [ "$arg" = "--force" ] && FORCE=true
+done
 
 MODEL_ROOT="${WORK_DIR}/models"
 OUTPUT_ROOT="${WORK_DIR}/renders"
@@ -51,12 +56,13 @@ scenes=()
 for model_dir in "${MODEL_ROOT}"/*/; do
     scene_name=$(basename "$model_dir")
     if [ -f "${model_dir}chkpnt_fine_30000.pth" ]; then
-        # Skip already rendered scenes
         render_dir="${OUTPUT_ROOT}/${scene_name}"
-        if [ -d "$render_dir" ] && [ "$(find "$render_dir" -name '*.png' 2>/dev/null | head -1)" ]; then
+        if [ "$FORCE" = false ] && [ -d "$render_dir" ] && [ "$(find "$render_dir" -name '*.png' 2>/dev/null | head -1)" ]; then
             echo "  SKIP (rendered): ${scene_name}"
             continue
         fi
+        # Clean old renders when --force
+        [ "$FORCE" = true ] && [ -d "$render_dir" ] && rm -rf "$render_dir"
         scenes+=("$scene_name")
     fi
 done

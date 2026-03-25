@@ -48,19 +48,15 @@ from utils.graphics_utils import focal2fov, getWorld2View2, getProjectionMatrix
 import torchvision
 
 
-# Camera mark names from config.yaml (for output filenames)
-CAMERA_MARKS = {
-    1: "front_left_bottom",
-    2: "front_right_bottom",
-    3: "front_left_top",
-    4: "front_right_top",
-    5: "rear_left_bottom",
-    6: "rear_right_bottom",
-    7: "rear_center_bottom",
-    8: "surround_front",
-    9: "surround_rear",
-    10: "surround_left",
-    11: "surround_right",
+# Camera ID -> short name mapping
+CAMERA_NAMES = {
+    1: "FN",   # front narrow
+    2: "FW",   # front wide
+    3: "FL",   # front left
+    4: "FR",   # front right
+    5: "RL",   # rear left
+    6: "RR",   # rear right
+    7: "RN",   # rear narrow
 }
 
 
@@ -277,14 +273,14 @@ def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
     os.makedirs(scene_out, exist_ok=True)
 
     for cam_id in tqdm(camera_ids, desc=scene_name):
-        cam_name = CAMERA_MARKS.get(cam_id, f"cam_{cam_id:02d}")
+        cam_name = CAMERA_NAMES.get(cam_id, f"cam{cam_id:02d}")
 
         # Load vehicle camera calibration (reads width/height/type from YAML)
         K, D, is_fisheye, R_cam2lidar, t_cam2lidar, orig_w, orig_h = load_vehicle_camera(
             vehicle_calib, cam_id
         )
 
-        print(f"  cam_{cam_id:02d} ({cam_name}): {orig_w}x{orig_h}, "
+        print(f"  {cam_name} (camera_{cam_id:02d}): {orig_w}x{orig_h}, "
               f"{'fisheye' if is_fisheye else 'pinhole'}")
 
         # Compute undistorted intrinsics at original resolution
@@ -312,9 +308,9 @@ def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
 
         rendering = render_pkg["render"]
 
-        # Save: {scene}/cam_XX.png (e.g. scene003_far/cam_01.png)
+        # Save: {scene}/{name}.png (e.g. scene003_far/FN.png)
         torchvision.utils.save_image(
-            rendering, os.path.join(scene_out, f"cam_{cam_id:02d}.png")
+            rendering, os.path.join(scene_out, f"{cam_name}.png")
         )
 
     print(f"Saved to {scene_out}")
