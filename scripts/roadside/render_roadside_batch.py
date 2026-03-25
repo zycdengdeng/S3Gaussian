@@ -86,15 +86,16 @@ def load_calib(calib_json_path):
     return cameras
 
 
-def load_scene_transforms(transform_root, scene_id):
-    """Load all world2lidar transforms for a scene.
+def load_scene_transform(transform_root, scene_id, target_ts_ms):
+    """Load the world2lidar transform closest to target_ts_ms.
 
     Args:
         transform_root: root dir containing scene subdirs (001/, 002/, ...)
         scene_id: scene number string (e.g. "003")
+        target_ts_ms: target timestamp in milliseconds
 
     Returns:
-        list of (timestamp, R_w2vl (3x3), t_w2vl (3,))
+        (timestamp_sec, R_w2vl (3x3), t_w2vl (3,))
     """
     scene_dir = os.path.join(transform_root, scene_id)
     json_files = glob.glob(os.path.join(scene_dir, "*.json"))
@@ -104,15 +105,26 @@ def load_scene_transforms(transform_root, scene_id):
     with open(json_files[0], 'r') as f:
         transforms = json.load(f)
 
-    results = []
+    # Find closest timestamp
+    best = None
+    best_diff = float('inf')
     for entry in transforms:
         ts = entry["timestamp"]
-        rotvec = np.array(entry["world2lidar"]["rotation"])
-        R_w2vl = Rotation.from_rotvec(rotvec).as_matrix()
-        t_w2vl = np.array(entry["world2lidar"]["translation"])
-        results.append((ts, R_w2vl, t_w2vl))
+        ts_ms = ts * 1000 if ts < 1e12 else ts
+        diff = abs(ts_ms - target_ts_ms)
+        if diff < best_diff:
+            best_diff = diff
+            best = entry
 
-    return results
+    if best is None:
+        raise ValueError(f"No transforms found in {scene_dir}")
+
+    rotvec = np.array(best["world2lidar"]["rotation"])
+    R_w2vl = Rotation.from_rotvec(rotvec).as_matrix()
+    t_w2vl = np.array(best["world2lidar"]["translation"])
+
+    print(f"  world2lidar: closest ts diff = {best_diff:.0f}ms")
+    return best["timestamp"], R_w2vl, t_w2vl
 
 
 def extract_scene_id(scene_name):
@@ -212,53 +224,45 @@ def load_trained_model(model_path, iteration, hyper_args):
     return gaussians
 
 
-def render_scene(model_path, cam_calibs, transforms, scene_name,
+def render_scene(model_path, cam_calibs, R_w2vl, t_w2vl, scene_name,
                  pipe, output_dir, time_val=0.0):
-    """Render one scene from all vehicle cameras at all timestamps."""
+    """Render one scene from all vehicle cameras at ONE timestamp."""
     gaussians = load_trained_model(model_path, 30000, pipe["hyper"])
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
     # Filter to non-fish cameras only (1280x720)
     render_cams = {cid: c for cid, c in cam_calibs.items() if not c["isFish"]}
 
-    total_renders = len(transforms) * len(render_cams)
-    print(f"Rendering {scene_name}: {len(transforms)} timestamps x {len(render_cams)} cameras = {total_renders} views at {RENDER_W}x{RENDER_H}")
+    print(f"Rendering {scene_name}: {len(render_cams)} cameras at {RENDER_W}x{RENDER_H}")
 
     scene_out = os.path.join(output_dir, scene_name)
+    os.makedirs(scene_out, exist_ok=True)
 
-    with tqdm(total=total_renders, desc=scene_name) as pbar:
-        for ts, R_w2vl, t_w2vl in transforms:
-            # Timestamp as string for filename
-            ts_str = f"{ts:.6f}"
+    for cam_id, calib in tqdm(render_cams.items(), desc=scene_name):
+        R_stored, T_stored = compute_w2c(
+            R_w2vl, t_w2vl, calib["R_vl2cam"], calib["t_vl2cam"]
+        )
 
-            for cam_id, calib in render_cams.items():
-                R_stored, T_stored = compute_w2c(
-                    R_w2vl, t_w2vl, calib["R_vl2cam"], calib["t_vl2cam"]
-                )
+        fx, fy = calib["K"][0, 0], calib["K"][1, 1]
+        fovx = focal2fov(fx, RENDER_W)
+        fovy = focal2fov(fy, RENDER_H)
 
-                fx, fy = calib["K"][0, 0], calib["K"][1, 1]
-                fovx = focal2fov(fx, RENDER_W)
-                fovy = focal2fov(fy, RENDER_H)
+        cam = create_minicam(
+            R_stored, T_stored, fovx, fovy,
+            RENDER_W, RENDER_H, time_val,
+        )
 
-                cam = create_minicam(
-                    R_stored, T_stored, fovx, fovy,
-                    RENDER_W, RENDER_H, time_val,
-                )
+        with torch.no_grad():
+            render_pkg = render(cam, gaussians, pipe["pipe"], bg_color, stage="fine")
 
-                with torch.no_grad():
-                    render_pkg = render(cam, gaussians, pipe["pipe"], bg_color, stage="fine")
+        rendering = render_pkg["render"]
 
-                rendering = render_pkg["render"]
+        # Save: {scene}/cam{id}.png
+        torchvision.utils.save_image(
+            rendering, os.path.join(scene_out, f"cam{cam_id}.png")
+        )
 
-                # Save: {scene}/cam{id}/{timestamp}.png
-                cam_dir = os.path.join(scene_out, f"cam{cam_id}")
-                os.makedirs(cam_dir, exist_ok=True)
-                torchvision.utils.save_image(
-                    rendering, os.path.join(cam_dir, f"{ts_str}.png")
-                )
-                pbar.update(1)
-
-    print(f"Saved to {scene_out}")
+    print(f"Saved {len(render_cams)} renders to {scene_out}")
 
 
 def main():
@@ -272,6 +276,9 @@ def main():
                         help="Path to calib.json")
     parser.add_argument("--transform_root", type=str, required=True,
                         help="Root of transform_json directories")
+    parser.add_argument("--timestamp_map", type=str,
+                        default=os.path.join(os.path.dirname(__file__), "scene_timestamps.json"),
+                        help="JSON mapping scene_name -> timestamp_ms")
     parser.add_argument("--output_root", type=str, required=True,
                         help="Output directory for rendered images")
     parser.add_argument("--scene_name", type=str, default=None,
@@ -282,6 +289,11 @@ def main():
     args = parser.parse_args()
     pipe_args = pipeline_params.extract(args)
     hyper = hyper_params.extract(args)
+
+    # Load timestamp mapping
+    with open(args.timestamp_map, 'r') as f:
+        ts_map = json.load(f)
+    print(f"Loaded timestamp mapping: {len(ts_map)} entries")
 
     # Load vehicle camera calibrations
     cam_calibs = load_calib(args.calib_json)
@@ -300,21 +312,30 @@ def main():
     print(f"Scenes to render: {len(scenes)}")
 
     for scene_name in scenes:
+        # Look up the ONE timestamp for this scene
+        if scene_name not in ts_map:
+            print(f"SKIP {scene_name}: not in timestamp mapping")
+            continue
+
+        target_ts_ms = ts_map[scene_name]
         model_path = os.path.join(args.model_root, scene_name)
         scene_id = extract_scene_id(scene_name)
 
+        print(f"\n{scene_name} (scene_id={scene_id}): target timestamp {target_ts_ms}")
+
         try:
-            transforms = load_scene_transforms(args.transform_root, scene_id)
+            ts_sec, R_w2vl, t_w2vl = load_scene_transform(
+                args.transform_root, scene_id, target_ts_ms
+            )
         except FileNotFoundError as e:
             print(f"SKIP {scene_name}: {e}")
             continue
 
-        print(f"\n{scene_name} (scene_id={scene_id}): {len(transforms)} timestamps")
-
         render_scene(
             model_path=model_path,
             cam_calibs=cam_calibs,
-            transforms=transforms,
+            R_w2vl=R_w2vl,
+            t_w2vl=t_w2vl,
             scene_name=scene_name,
             pipe={"pipe": pipe_args, "hyper": hyper},
             output_dir=args.output_root,
