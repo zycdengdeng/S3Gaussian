@@ -6,6 +6,8 @@ Transform chain (vehicle cameras):
 
 Data sources:
   - vehicle_calib/camera/camera_XX_{intrinsics,extrinsics}.yaml: vehicle camera calibration
+    intrinsics YAML fields: K, D, width, height, type (pinhole/fisheye)
+    extrinsics YAML fields: transform.rotation (quaternion xyzw), transform.translation (xyz)
   - transform_json/{scene_id}/*.json: per-scene world2lidar transforms
   - scene_timestamps.json: maps scene_name -> target timestamp (ms)
   - models/{scene_name}/chkpnt_fine_30000.pth: trained S3Gaussian model
@@ -13,7 +15,7 @@ Data sources:
 Usage:
   python scripts/roadside/render_roadside_batch.py \
     --model_root /path/to/work_dir/models \
-    --vehicle_calib /path/to/vehicle/calibration \
+    --vehicle_calib /path/to/NoEER705_v3 \
     --transform_root /path/to/transform_json \
     --output_root /path/to/work_dir/renders
 
@@ -46,15 +48,19 @@ from utils.graphics_utils import focal2fov, getWorld2View2, getProjectionMatrix
 import torchvision
 
 
-# Vehicle camera definitions
-VEHICLE_CAMERAS = {
-    1: {"name": "FN", "desc": "front narrow 30°",  "resolution": (3840, 2160)},
-    2: {"name": "FW", "desc": "front wide 120°",   "resolution": (3840, 2160)},
-    3: {"name": "FL", "desc": "front-left 120°",   "resolution": (3840, 2160)},
-    4: {"name": "FR", "desc": "front-right 120°",  "resolution": (3840, 2160)},
-    5: {"name": "RL", "desc": "rear-left 60°",     "resolution": (1920, 1080)},
-    6: {"name": "RR", "desc": "rear-right 60°",    "resolution": (1920, 1080)},
-    7: {"name": "RN", "desc": "rear narrow 60°",   "resolution": (1920, 1080)},
+# Camera mark names from config.yaml (for output filenames)
+CAMERA_MARKS = {
+    1: "front_left_bottom",
+    2: "front_right_bottom",
+    3: "front_left_top",
+    4: "front_right_top",
+    5: "rear_left_bottom",
+    6: "rear_right_bottom",
+    7: "rear_center_bottom",
+    8: "surround_front",
+    9: "surround_rear",
+    10: "surround_left",
+    11: "surround_right",
 }
 
 
@@ -71,8 +77,11 @@ def quaternion_to_rotation_matrix(q):
 def load_vehicle_camera(calib_folder, cam_id):
     """Load vehicle camera intrinsics and extrinsics from YAML files.
 
+    Reads width, height, type (pinhole/fisheye) directly from intrinsics YAML.
+
     Returns:
-        K (3x3), D (distortion), R_cam2lidar (3x3), t_cam2lidar (3,), resolution (w, h)
+        K (3x3), D (distortion), is_fisheye (bool),
+        R_cam2lidar (3x3), t_cam2lidar (3,), width (int), height (int)
     """
     calib_folder = Path(calib_folder)
     cam_subdir = calib_folder / "camera"
@@ -84,6 +93,10 @@ def load_vehicle_camera(calib_folder, cam_id):
         intrinsics = yaml.safe_load(f)
     K = np.array(intrinsics['K']).reshape(3, 3)
     D = np.array(intrinsics['D'])
+    width = int(intrinsics['width'])
+    height = int(intrinsics['height'])
+    cam_type = intrinsics.get('type', 'pinhole')
+    is_fisheye = (cam_type == 'fisheye')
 
     # Extrinsics (camera -> lidar)
     extr_path = base / f"camera_{cam_id:02d}_extrinsics.yaml"
@@ -97,19 +110,20 @@ def load_vehicle_camera(calib_folder, cam_id):
                   transform['translation']['z']])
 
     R_cam2lidar = quaternion_to_rotation_matrix(q)
-    resolution = VEHICLE_CAMERAS[cam_id]["resolution"]
-    return K, D, R_cam2lidar, t, resolution
+    return K, D, is_fisheye, R_cam2lidar, t, width, height
 
 
-def compute_undistorted_intrinsics(K, D, cam_id, resolution):
-    """Compute new camera matrix after undistortion."""
-    w, h = resolution
-    if cam_id in [2, 3, 4] and np.max(np.abs(D)) > 1:
+def compute_undistorted_intrinsics(K, D, is_fisheye, width, height):
+    """Compute new camera matrix after undistortion.
+
+    Uses type from YAML to decide pinhole vs fisheye undistortion.
+    """
+    if is_fisheye:
         new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
-            K, D[:4], (w, h), np.eye(3), balance=0.0
+            K, D[:4], (width, height), np.eye(3), balance=0.0
         )
     else:
-        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 0, (w, h))
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (width, height), 0, (width, height))
     return new_K
 
 
@@ -263,21 +277,18 @@ def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
     os.makedirs(scene_out, exist_ok=True)
 
     for cam_id in tqdm(camera_ids, desc=scene_name):
-        cam_info = VEHICLE_CAMERAS.get(cam_id)
-        if cam_info is None:
-            print(f"  Unknown camera ID: {cam_id}, skipping")
-            continue
+        cam_name = CAMERA_MARKS.get(cam_id, f"cam_{cam_id:02d}")
 
-        cam_name = cam_info["name"]
-
-        # Load vehicle camera calibration
-        K, D, R_cam2lidar, t_cam2lidar, resolution = load_vehicle_camera(
+        # Load vehicle camera calibration (reads width/height/type from YAML)
+        K, D, is_fisheye, R_cam2lidar, t_cam2lidar, orig_w, orig_h = load_vehicle_camera(
             vehicle_calib, cam_id
         )
-        orig_w, orig_h = resolution
+
+        print(f"  cam_{cam_id:02d} ({cam_name}): {orig_w}x{orig_h}, "
+              f"{'fisheye' if is_fisheye else 'pinhole'}")
 
         # Compute undistorted intrinsics at original resolution
-        new_K = compute_undistorted_intrinsics(K, D, cam_id, resolution)
+        new_K = compute_undistorted_intrinsics(K, D, is_fisheye, orig_w, orig_h)
 
         # Scale intrinsics from original resolution to 1280x720
         scale_x = RENDER_W / orig_w
@@ -301,9 +312,9 @@ def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
 
         rendering = render_pkg["render"]
 
-        # Save: {scene}/{cam_name}.png (e.g. scene003_far/FN.png)
+        # Save: {scene}/cam_XX.png (e.g. scene003_far/cam_01.png)
         torchvision.utils.save_image(
-            rendering, os.path.join(scene_out, f"{cam_name}.png")
+            rendering, os.path.join(scene_out, f"cam_{cam_id:02d}.png")
         )
 
     print(f"Saved to {scene_out}")
@@ -317,7 +328,7 @@ def main():
     parser.add_argument("--model_root", type=str, required=True,
                         help="Root of trained models (work_dir/models)")
     parser.add_argument("--vehicle_calib", type=str, required=True,
-                        help="Path to vehicle calibration folder (contains camera/ subdir with YAML files)")
+                        help="Path to vehicle calibration folder (e.g. NoEER705_v3, contains camera/ subdir)")
     parser.add_argument("--transform_root", type=str, required=True,
                         help="Root of transform_json directories")
     parser.add_argument("--timestamp_map", type=str,
@@ -328,7 +339,7 @@ def main():
     parser.add_argument("--scene_name", type=str, default=None,
                         help="Render specific scene (default: all)")
     parser.add_argument("--camera_ids", type=int, nargs='+', default=[1, 2, 3, 4, 5, 6, 7],
-                        help="Vehicle camera IDs to render (default: all 7)")
+                        help="Vehicle camera IDs to render (default: 1-7 pinhole)")
     parser.add_argument("--time", type=float, default=0.0,
                         help="Time value for deformation network (0.0 = first frame)")
 
@@ -347,9 +358,7 @@ def main():
     calib_base = cam_subdir if cam_subdir.is_dir() else calib_path
     print(f"Vehicle calibration: {calib_base}")
     print(f"Render resolution: {RENDER_W}x{RENDER_H}")
-    for cid in args.camera_ids:
-        cam_name = VEHICLE_CAMERAS[cid]["name"]
-        print(f"  cam{cid} ({cam_name})")
+    print(f"Camera IDs: {args.camera_ids}")
 
     # Discover scenes
     if args.scene_name:
