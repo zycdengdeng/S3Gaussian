@@ -19,10 +19,13 @@ Usage:
     --output_root /path/to/work_dir/renders
 """
 
+import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
 import torch
 import numpy as np
 import json
-import os
 import math
 import glob
 from pathlib import Path
