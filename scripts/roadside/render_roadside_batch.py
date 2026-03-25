@@ -327,8 +327,8 @@ def main():
                         help="Output directory for rendered images")
     parser.add_argument("--scene_name", type=str, default=None,
                         help="Render specific scene (default: all)")
-    parser.add_argument("--camera_ids", type=int, nargs='+', default=[1, 5, 6, 7],
-                        help="Vehicle camera IDs to render (default: 1 5 6 7, non-fisheye)")
+    parser.add_argument("--camera_ids", type=int, nargs='+', default=[1, 2, 3, 4, 5, 6, 7],
+                        help="Vehicle camera IDs to render (default: all 7)")
     parser.add_argument("--time", type=float, default=0.0,
                         help="Time value for deformation network (0.0 = first frame)")
 
