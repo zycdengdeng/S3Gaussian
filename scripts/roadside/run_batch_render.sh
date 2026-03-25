@@ -2,21 +2,22 @@
 # ============================================================
 # S3Gaussian 批量渲染脚本 — 渲染到车端视角 (1280x720)
 #
-# 使用车端标定 (cam2lidar + world2lidar) 投影到车端相机
-# 在同一张GPU上并行渲染所有场景
+# 投影链: World --(world2lidar)--> VirtualLiDAR --(virtualLidarToCam)--> Camera
 #
 # 用法:
-#   bash scripts/roadside/run_batch_render.sh <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]
+#   bash scripts/roadside/run_batch_render.sh <GPU_ID> <CALIB_JSON> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]
 #
 # 参数:
 #   GPU_ID          - 使用的GPU编号 (必须)
-#   VEHICLE_CALIB   - 车端标定文件夹 (必须)
-#   TRANSFORM_JSON  - world2lidar变换JSON文件 (必须)
+#   CALIB_JSON      - calib.json路径 (必须)
+#   TRANSFORM_ROOT  - transform_json根目录 (必须)
 #   WORK_DIR        - 工作目录 (默认: /mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap)
 #   PARALLEL        - 同时跑几个任务 (默认: 6)
 #
 # 示例:
-#   bash scripts/roadside/run_batch_render.sh 3 /path/to/vehicle_calib /path/to/world2lidar.json
+#   bash scripts/roadside/run_batch_render.sh 3 \
+#     /mnt/car_road_data_TianJin/support_info/calib.json \
+#     /mnt/car_road_data_TianJin/support_info/transform_json
 # ============================================================
 set -e
 
@@ -24,9 +25,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-GPU_ID=${1:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]"}
-VEHICLE_CALIB=${2:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]"}
-TRANSFORM_JSON=${3:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]"}
+GPU_ID=${1:?"Usage: $0 <GPU_ID> <CALIB_JSON> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]"}
+CALIB_JSON=${2:?"Usage: $0 <GPU_ID> <CALIB_JSON> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]"}
+TRANSFORM_ROOT=${3:?"Usage: $0 <GPU_ID> <CALIB_JSON> <TRANSFORM_ROOT> [WORK_DIR] [PARALLEL]"}
 WORK_DIR=${4:-"/mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap"}
 PARALLEL=${5:-6}
 
@@ -39,8 +40,8 @@ mkdir -p "$OUTPUT_ROOT" "$LOG_DIR"
 echo "=========================================="
 echo " S3Gaussian Batch Vehicle Rendering (1280x720)"
 echo " GPU: ${GPU_ID}, Parallel: ${PARALLEL}"
-echo " Vehicle calib: ${VEHICLE_CALIB}"
-echo " Transform JSON: ${TRANSFORM_JSON}"
+echo " Calib: ${CALIB_JSON}"
+echo " Transforms: ${TRANSFORM_ROOT}"
 echo " Models: ${MODEL_ROOT}"
 echo " Output: ${OUTPUT_ROOT}"
 echo "=========================================="
@@ -86,8 +87,8 @@ run_worker() {
 
         if CUDA_VISIBLE_DEVICES=${GPU_ID} python scripts/roadside/render_roadside_batch.py \
             --model_root "$MODEL_ROOT" \
-            --vehicle_calib "$VEHICLE_CALIB" \
-            --transform_json "$TRANSFORM_JSON" \
+            --calib_json "$CALIB_JSON" \
+            --transform_root "$TRANSFORM_ROOT" \
             --output_root "$OUTPUT_ROOT" \
             --scene_name "$scene_name" \
             > "$log_file" 2>&1; then
