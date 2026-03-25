@@ -1,20 +1,22 @@
 #!/bin/bash
 # ============================================================
-# S3Gaussian 批量渲染脚本 — 在同一张GPU上并行渲染所有场景
+# S3Gaussian 批量渲染脚本 — 渲染到车端视角 (1280x720)
 #
-# 输出 1280x720 的渲染图片
+# 使用车端标定 (cam2lidar + world2lidar) 投影到车端相机
+# 在同一张GPU上并行渲染所有场景
 #
 # 用法:
-#   bash scripts/roadside/run_batch_render.sh <GPU_ID> [WORK_DIR] [PARALLEL]
+#   bash scripts/roadside/run_batch_render.sh <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]
 #
 # 参数:
-#   GPU_ID     - 使用的GPU编号 (必须)
-#   WORK_DIR   - 工作目录 (默认: /mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap)
-#   PARALLEL   - 同时跑几个任务 (默认: 6)
+#   GPU_ID          - 使用的GPU编号 (必须)
+#   VEHICLE_CALIB   - 车端标定文件夹 (必须)
+#   TRANSFORM_JSON  - world2lidar变换JSON文件 (必须)
+#   WORK_DIR        - 工作目录 (默认: /mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap)
+#   PARALLEL        - 同时跑几个任务 (默认: 6)
 #
 # 示例:
-#   bash scripts/roadside/run_batch_render.sh 3
-#   bash scripts/roadside/run_batch_render.sh 3 /mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap 6
+#   bash scripts/roadside/run_batch_render.sh 3 /path/to/vehicle_calib /path/to/world2lidar.json
 # ============================================================
 set -e
 
@@ -22,11 +24,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
-GPU_ID=${1:?"Usage: $0 <GPU_ID> [WORK_DIR] [PARALLEL]"}
-WORK_DIR=${2:-"/mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap"}
-PARALLEL=${3:-6}
+GPU_ID=${1:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]"}
+VEHICLE_CALIB=${2:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]"}
+TRANSFORM_JSON=${3:?"Usage: $0 <GPU_ID> <VEHICLE_CALIB> <TRANSFORM_JSON> [WORK_DIR] [PARALLEL]"}
+WORK_DIR=${4:-"/mnt/zyc_wzh/S3Gaussian/work_dirs/roadside_colmap"}
+PARALLEL=${5:-6}
 
-DATA_ROOT="${WORK_DIR}/data"
 MODEL_ROOT="${WORK_DIR}/models"
 OUTPUT_ROOT="${WORK_DIR}/renders"
 LOG_DIR="${WORK_DIR}/logs_render"
@@ -34,22 +37,22 @@ LOG_DIR="${WORK_DIR}/logs_render"
 mkdir -p "$OUTPUT_ROOT" "$LOG_DIR"
 
 echo "=========================================="
-echo " S3Gaussian Batch Rendering (1280x720)"
+echo " S3Gaussian Batch Vehicle Rendering (1280x720)"
 echo " GPU: ${GPU_ID}, Parallel: ${PARALLEL}"
-echo " Data: ${DATA_ROOT}"
+echo " Vehicle calib: ${VEHICLE_CALIB}"
+echo " Transform JSON: ${TRANSFORM_JSON}"
 echo " Models: ${MODEL_ROOT}"
 echo " Output: ${OUTPUT_ROOT}"
 echo "=========================================="
 
 # Collect scenes that have trained checkpoints
 scenes=()
-for scene_dir in "${DATA_ROOT}"/*/; do
-    scene_name=$(basename "$scene_dir")
-    model_path="${MODEL_ROOT}/${scene_name}"
-    if [ -f "${model_path}/chkpnt_fine_30000.pth" ]; then
-        # Skip already rendered scenes (check if output dir has any .png)
+for model_dir in "${MODEL_ROOT}"/*/; do
+    scene_name=$(basename "$model_dir")
+    if [ -f "${model_dir}chkpnt_fine_30000.pth" ]; then
+        # Skip already rendered scenes
         render_dir="${OUTPUT_ROOT}/${scene_name}"
-        if [ -d "$render_dir" ] && ls "$render_dir"/*.png >/dev/null 2>&1; then
+        if [ -d "$render_dir" ] && [ "$(find "$render_dir" -name '*.png' 2>/dev/null | head -1)" ]; then
             echo "  SKIP (rendered): ${scene_name}"
             continue
         fi
@@ -66,7 +69,7 @@ if [ "$total" -eq 0 ]; then
     exit 0
 fi
 
-# Worker function: render scenes sequentially
+# Worker function
 run_worker() {
     local worker_id="$1"
     shift
@@ -82,8 +85,9 @@ run_worker() {
         echo "[W${worker_id}] START (${wdone}/${wtotal}): ${scene_name}"
 
         if CUDA_VISIBLE_DEVICES=${GPU_ID} python scripts/roadside/render_roadside_batch.py \
-            --data_root "$DATA_ROOT" \
             --model_root "$MODEL_ROOT" \
+            --vehicle_calib "$VEHICLE_CALIB" \
+            --transform_json "$TRANSFORM_JSON" \
             --output_root "$OUTPUT_ROOT" \
             --scene_name "$scene_name" \
             > "$log_file" 2>&1; then
@@ -97,7 +101,7 @@ run_worker() {
     return $wfailed
 }
 
-# Round-robin distribute scenes across workers
+# Round-robin distribute
 declare -a worker_lists
 for i in $(seq 0 $((PARALLEL - 1))); do
     worker_lists[$i]=""
@@ -108,7 +112,6 @@ for i in "${!scenes[@]}"; do
     worker_lists[$w]+="${scenes[$i]}"$'\n'
 done
 
-# Launch workers
 echo ""
 echo "Launching ${PARALLEL} workers on GPU ${GPU_ID}..."
 echo ""
@@ -127,7 +130,6 @@ for w in $(seq 0 $((PARALLEL - 1))); do
     pids+=($!)
 done
 
-# Wait for all workers
 failed=0
 for pid in "${pids[@]}"; do
     wait "$pid" || failed=$((failed + $?))
@@ -146,7 +148,7 @@ if [ $failed -gt 0 ]; then
     echo "Failed scenes (check logs):"
     for scene_name in "${scenes[@]}"; do
         render_dir="${OUTPUT_ROOT}/${scene_name}"
-        if [ ! -d "$render_dir" ] || ! ls "$render_dir"/*.png >/dev/null 2>&1; then
+        if [ ! -d "$render_dir" ] || [ ! "$(find "$render_dir" -name '*.png' 2>/dev/null | head -1)" ]; then
             echo "  - ${scene_name}: ${LOG_DIR}/${scene_name}.log"
         fi
     done
