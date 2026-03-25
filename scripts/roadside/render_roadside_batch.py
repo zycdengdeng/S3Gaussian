@@ -1,27 +1,23 @@
 """
-Batch render trained S3Gaussian roadside scenes from vehicle cameras at 1280x720.
+Batch render trained S3Gaussian roadside scenes from VEHICLE camera viewpoints.
 
-Transform chain:
-  World --(world2lidar)--> VirtualLiDAR --(virtualLidarToCam)--> Camera
+Transform chain (vehicle cameras):
+  Vehicle Camera --(cam2lidar)--> Vehicle LiDAR --(inv world2lidar)--> World (virtualLiDAR)
 
 Data sources:
-  - calib.json: vehicle camera intrinsics + virtualLidarToCam extrinsics
-  - transform_json/{scene_id}/*.json: per-scene world2lidar transforms (all timestamps)
+  - vehicle_calib/camera/camera_XX_{intrinsics,extrinsics}.yaml: vehicle camera calibration
+  - transform_json/{scene_id}/*.json: per-scene world2lidar transforms
+  - scene_timestamps.json: maps scene_name -> target timestamp (ms)
   - models/{scene_name}/chkpnt_fine_30000.pth: trained S3Gaussian model
 
 Usage:
   python scripts/roadside/render_roadside_batch.py \
     --model_root /path/to/work_dir/models \
-    --calib_json /path/to/calib.json \
+    --vehicle_calib /path/to/vehicle/calibration \
     --transform_root /path/to/transform_json \
     --output_root /path/to/work_dir/renders
 
-  Or render a specific scene:
-  python scripts/roadside/render_roadside_batch.py \
-    --model_root /path/to/work_dir/models \
-    --calib_json /path/to/calib.json \
-    --transform_root /path/to/transform_json \
-    --output_root /path/to/work_dir/renders \
+  Render a specific scene:
     --scene_name scene003_far
 """
 
@@ -31,9 +27,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import torch
 import numpy as np
+import cv2
 import json
+import yaml
 import glob
 import re
+import math
+from pathlib import Path
 from argparse import ArgumentParser
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation
@@ -46,56 +46,78 @@ from utils.graphics_utils import focal2fov, getWorld2View2, getProjectionMatrix
 import torchvision
 
 
-# Target render resolution
-RENDER_W = 1280
-RENDER_H = 720
+# Vehicle camera definitions
+VEHICLE_CAMERAS = {
+    1: {"name": "FN", "desc": "front narrow 30°",  "resolution": (3840, 2160)},
+    2: {"name": "FW", "desc": "front wide 120°",   "resolution": (3840, 2160)},
+    3: {"name": "FL", "desc": "front-left 120°",   "resolution": (3840, 2160)},
+    4: {"name": "FR", "desc": "front-right 120°",  "resolution": (3840, 2160)},
+    5: {"name": "RL", "desc": "rear-left 60°",     "resolution": (1920, 1080)},
+    6: {"name": "RR", "desc": "rear-right 60°",    "resolution": (1920, 1080)},
+    7: {"name": "RN", "desc": "rear narrow 60°",   "resolution": (1920, 1080)},
+}
 
 
-def load_calib(calib_json_path):
-    """Load vehicle camera calibrations from calib.json.
+def quaternion_to_rotation_matrix(q):
+    """Quaternion (x, y, z, w) to 3x3 rotation matrix."""
+    x, y, z, w = q
+    return np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - z*w),     2*(x*z + y*w)],
+        [2*(x*y + z*w),     1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w),     2*(y*z + x*w),     1 - 2*(x*x + y*y)]
+    ])
 
-    Returns dict: cam_id -> {K (3x3), distor, R_vl2cam (3x3), t_vl2cam (3,), isFish}
+
+def load_vehicle_camera(calib_folder, cam_id):
+    """Load vehicle camera intrinsics and extrinsics from YAML files.
+
+    Returns:
+        K (3x3), D (distortion), R_cam2lidar (3x3), t_cam2lidar (3,), resolution (w, h)
     """
-    with open(calib_json_path, 'r') as f:
-        calib = json.load(f)
+    calib_folder = Path(calib_folder)
+    cam_subdir = calib_folder / "camera"
+    base = cam_subdir if cam_subdir.is_dir() else calib_folder
 
-    cameras = {}
-    for cam_id_str, cam_data in calib["camera"].items():
-        cam_id = int(cam_id_str)
-        is_fish = cam_data["isFish"]
+    # Intrinsics
+    intr_path = base / f"camera_{cam_id:02d}_intrinsics.yaml"
+    with open(intr_path, 'r') as f:
+        intrinsics = yaml.safe_load(f)
+    K = np.array(intrinsics['K']).reshape(3, 3)
+    D = np.array(intrinsics['D'])
 
-        # Intrinsic matrix (row-major flattened 3x3)
-        K = np.array(cam_data["intri"]).reshape(3, 3)
-        distor = np.array(cam_data["distor"])
+    # Extrinsics (camera -> lidar)
+    extr_path = base / f"camera_{cam_id:02d}_extrinsics.yaml"
+    with open(extr_path, 'r') as f:
+        extrinsics = yaml.safe_load(f)
+    transform = extrinsics['transform']
+    q = [transform['rotation']['x'], transform['rotation']['y'],
+         transform['rotation']['z'], transform['rotation']['w']]
+    t = np.array([transform['translation']['x'],
+                  transform['translation']['y'],
+                  transform['translation']['z']])
 
-        # virtualLidarToCam: Rodrigues rotation vector + translation
-        vl2cam = cam_data["virtualLidarToCam"]
-        rotvec = np.array(vl2cam["rotate"])
-        R_vl2cam = Rotation.from_rotvec(rotvec).as_matrix()
-        t_vl2cam = np.array(vl2cam["trans"])
+    R_cam2lidar = quaternion_to_rotation_matrix(q)
+    resolution = VEHICLE_CAMERAS[cam_id]["resolution"]
+    return K, D, R_cam2lidar, t, resolution
 
-        cameras[cam_id] = {
-            "K": K,
-            "distor": distor,
-            "R_vl2cam": R_vl2cam,
-            "t_vl2cam": t_vl2cam,
-            "isFish": is_fish,
-            "name": cam_data.get("name", f"cam{cam_id}"),
-        }
 
-    return cameras
+def compute_undistorted_intrinsics(K, D, cam_id, resolution):
+    """Compute new camera matrix after undistortion."""
+    w, h = resolution
+    if cam_id in [2, 3, 4] and np.max(np.abs(D)) > 1:
+        new_K = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+            K, D[:4], (w, h), np.eye(3), balance=0.0
+        )
+    else:
+        new_K, _ = cv2.getOptimalNewCameraMatrix(K, D, (w, h), 0, (w, h))
+    return new_K
 
 
 def load_scene_transform(transform_root, scene_id, target_ts_ms):
     """Load the world2lidar transform closest to target_ts_ms.
 
-    Args:
-        transform_root: root dir containing scene subdirs (001/, 002/, ...)
-        scene_id: scene number string (e.g. "003")
-        target_ts_ms: target timestamp in milliseconds
-
     Returns:
-        (timestamp_sec, R_w2vl (3x3), t_w2vl (3,))
+        (timestamp, R_w2l (3x3), t_w2l (3,))
     """
     scene_dir = os.path.join(transform_root, scene_id)
     json_files = glob.glob(os.path.join(scene_dir, "*.json"))
@@ -105,7 +127,6 @@ def load_scene_transform(transform_root, scene_id, target_ts_ms):
     with open(json_files[0], 'r') as f:
         transforms = json.load(f)
 
-    # Find closest timestamp
     best = None
     best_diff = float('inf')
     for entry in transforms:
@@ -120,11 +141,11 @@ def load_scene_transform(transform_root, scene_id, target_ts_ms):
         raise ValueError(f"No transforms found in {scene_dir}")
 
     rotvec = np.array(best["world2lidar"]["rotation"])
-    R_w2vl = Rotation.from_rotvec(rotvec).as_matrix()
-    t_w2vl = np.array(best["world2lidar"]["translation"])
+    R_w2l = Rotation.from_rotvec(rotvec).as_matrix()
+    t_w2l = np.array(best["world2lidar"]["translation"])
 
     print(f"  world2lidar: closest ts diff = {best_diff:.0f}ms")
-    return best["timestamp"], R_w2vl, t_w2vl
+    return best["timestamp"], R_w2l, t_w2l
 
 
 def extract_scene_id(scene_name):
@@ -135,24 +156,27 @@ def extract_scene_id(scene_name):
     raise ValueError(f"Cannot extract scene ID from '{scene_name}'")
 
 
-def compute_w2c(R_w2vl, t_w2vl, R_vl2cam, t_vl2cam):
-    """World -> VirtualLiDAR -> Camera.
+def compute_vehicle_w2c(R_w2l, t_w2l, R_cam2lidar, t_cam2lidar):
+    """Compute world-to-camera for vehicle camera.
 
-    Returns R_stored, T_stored in S3Gaussian convention.
+    Chain: Camera --(cam2lidar)--> LiDAR --(inv world2lidar)--> World
+    So: T_c2w = inv(T_w2l) @ T_c2l
+        T_w2c = inv(T_c2w)
+
+    Returns R_stored, T_stored in S3Gaussian convention (R transposed).
     """
-    # Build 4x4 transforms
-    T_w2vl = np.eye(4)
-    T_w2vl[:3, :3] = R_w2vl
-    T_w2vl[:3, 3] = t_w2vl
+    T_w2l = np.eye(4)
+    T_w2l[:3, :3] = R_w2l
+    T_w2l[:3, 3] = t_w2l
 
-    T_vl2cam = np.eye(4)
-    T_vl2cam[:3, :3] = R_vl2cam
-    T_vl2cam[:3, 3] = t_vl2cam
+    T_c2l = np.eye(4)
+    T_c2l[:3, :3] = R_cam2lidar
+    T_c2l[:3, 3] = t_cam2lidar
 
-    # World -> Camera = VL2Cam @ W2VL
-    T_w2c = T_vl2cam @ T_w2vl
+    T_l2w = np.linalg.inv(T_w2l)
+    T_c2w = T_l2w @ T_c2l
+    T_w2c = np.linalg.inv(T_c2w)
 
-    # S3Gaussian convention: R stored transposed
     R_stored = T_w2c[:3, :3].T
     T_stored = T_w2c[:3, 3]
     return R_stored, T_stored
@@ -189,7 +213,6 @@ def load_trained_model(model_path, iteration, hyper_args):
     sh_degree = 3
     cfg_path = os.path.join(model_path, "cfg_args")
     if os.path.exists(cfg_path):
-        from argparse import Namespace
         with open(cfg_path) as f:
             cfg = eval(f.read())
             if hasattr(cfg, 'sh_degree'):
@@ -224,56 +247,79 @@ def load_trained_model(model_path, iteration, hyper_args):
     return gaussians
 
 
-def render_scene(model_path, cam_calibs, R_w2vl, t_w2vl, scene_name,
-                 pipe, output_dir, time_val=0.0):
-    """Render one scene from all vehicle cameras at ONE timestamp."""
+def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
+                 scene_name, pipe, output_dir, render_scale=4, time_val=0.0):
+    """Render one scene from vehicle cameras at ONE timestamp."""
     gaussians = load_trained_model(model_path, 30000, pipe["hyper"])
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    # Filter to non-fish cameras only (1280x720)
-    render_cams = {cid: c for cid, c in cam_calibs.items() if not c["isFish"]}
-
-    print(f"Rendering {scene_name}: {len(render_cams)} cameras at {RENDER_W}x{RENDER_H}")
+    print(f"Rendering {scene_name}: {len(camera_ids)} vehicle cameras")
 
     scene_out = os.path.join(output_dir, scene_name)
     os.makedirs(scene_out, exist_ok=True)
 
-    for cam_id, calib in tqdm(render_cams.items(), desc=scene_name):
-        R_stored, T_stored = compute_w2c(
-            R_w2vl, t_w2vl, calib["R_vl2cam"], calib["t_vl2cam"]
+    for cam_id in tqdm(camera_ids, desc=scene_name):
+        cam_info = VEHICLE_CAMERAS.get(cam_id)
+        if cam_info is None:
+            print(f"  Unknown camera ID: {cam_id}, skipping")
+            continue
+
+        cam_name = cam_info["name"]
+
+        # Load vehicle camera calibration
+        K, D, R_cam2lidar, t_cam2lidar, resolution = load_vehicle_camera(
+            vehicle_calib, cam_id
+        )
+        w, h = resolution
+
+        # Apply render scale
+        if render_scale != 1:
+            w = w // render_scale
+            h = h // render_scale
+
+        # Compute undistorted intrinsics
+        new_K = compute_undistorted_intrinsics(K, D, cam_id, resolution)
+
+        # Scale intrinsics
+        if render_scale != 1:
+            scale_x = w / resolution[0]
+            scale_y = h / resolution[1]
+            new_K[0, :] *= scale_x
+            new_K[1, :] *= scale_y
+
+        fx, fy = new_K[0, 0], new_K[1, 1]
+        fovx = focal2fov(fx, w)
+        fovy = focal2fov(fy, h)
+
+        # Compute vehicle camera pose in world coordinates
+        R_stored, T_stored = compute_vehicle_w2c(
+            R_w2l, t_w2l, R_cam2lidar, t_cam2lidar
         )
 
-        fx, fy = calib["K"][0, 0], calib["K"][1, 1]
-        fovx = focal2fov(fx, RENDER_W)
-        fovy = focal2fov(fy, RENDER_H)
-
-        cam = create_minicam(
-            R_stored, T_stored, fovx, fovy,
-            RENDER_W, RENDER_H, time_val,
-        )
+        cam = create_minicam(R_stored, T_stored, fovx, fovy, w, h, time_val)
 
         with torch.no_grad():
             render_pkg = render(cam, gaussians, pipe["pipe"], bg_color, stage="fine")
 
         rendering = render_pkg["render"]
 
-        # Save: {scene}/cam{id}.png
+        # Save: {scene}/{cam_name}.png (e.g. scene003_far/FN.png)
         torchvision.utils.save_image(
-            rendering, os.path.join(scene_out, f"cam{cam_id}.png")
+            rendering, os.path.join(scene_out, f"{cam_name}.png")
         )
 
-    print(f"Saved {len(render_cams)} renders to {scene_out}")
+    print(f"Saved to {scene_out}")
 
 
 def main():
-    parser = ArgumentParser(description="Batch render roadside scenes from vehicle cameras at 1280x720")
+    parser = ArgumentParser(description="Batch render roadside scenes from vehicle camera viewpoints")
     pipeline_params = PipelineParams(parser)
     hyper_params = ModelHiddenParams(parser)
 
     parser.add_argument("--model_root", type=str, required=True,
                         help="Root of trained models (work_dir/models)")
-    parser.add_argument("--calib_json", type=str, required=True,
-                        help="Path to calib.json")
+    parser.add_argument("--vehicle_calib", type=str, required=True,
+                        help="Path to vehicle calibration folder (contains camera/ subdir with YAML files)")
     parser.add_argument("--transform_root", type=str, required=True,
                         help="Root of transform_json directories")
     parser.add_argument("--timestamp_map", type=str,
@@ -283,6 +329,10 @@ def main():
                         help="Output directory for rendered images")
     parser.add_argument("--scene_name", type=str, default=None,
                         help="Render specific scene (default: all)")
+    parser.add_argument("--camera_ids", type=int, nargs='+', default=[1, 5, 6, 7],
+                        help="Vehicle camera IDs to render (default: 1 5 6 7, non-fisheye)")
+    parser.add_argument("--render_scale", type=int, default=4,
+                        help="Downscale factor for rendering resolution (default: 4)")
     parser.add_argument("--time", type=float, default=0.0,
                         help="Time value for deformation network (0.0 = first frame)")
 
@@ -295,10 +345,16 @@ def main():
         ts_map = json.load(f)
     print(f"Loaded timestamp mapping: {len(ts_map)} entries")
 
-    # Load vehicle camera calibrations
-    cam_calibs = load_calib(args.calib_json)
-    non_fish = [cid for cid, c in cam_calibs.items() if not c["isFish"]]
-    print(f"Loaded {len(cam_calibs)} cameras ({len(non_fish)} non-fish: {sorted(non_fish)})")
+    # Verify vehicle calibration folder
+    calib_path = Path(args.vehicle_calib)
+    cam_subdir = calib_path / "camera"
+    calib_base = cam_subdir if cam_subdir.is_dir() else calib_path
+    print(f"Vehicle calibration: {calib_base}")
+    for cid in args.camera_ids:
+        cam_name = VEHICLE_CAMERAS[cid]["name"]
+        res = VEHICLE_CAMERAS[cid]["resolution"]
+        w, h = res[0] // args.render_scale, res[1] // args.render_scale
+        print(f"  cam{cid} ({cam_name}): {w}x{h}")
 
     # Discover scenes
     if args.scene_name:
@@ -312,7 +368,6 @@ def main():
     print(f"Scenes to render: {len(scenes)}")
 
     for scene_name in scenes:
-        # Look up the ONE timestamp for this scene
         if scene_name not in ts_map:
             print(f"SKIP {scene_name}: not in timestamp mapping")
             continue
@@ -324,7 +379,7 @@ def main():
         print(f"\n{scene_name} (scene_id={scene_id}): target timestamp {target_ts_ms}")
 
         try:
-            ts_sec, R_w2vl, t_w2vl = load_scene_transform(
+            _, R_w2l, t_w2l = load_scene_transform(
                 args.transform_root, scene_id, target_ts_ms
             )
         except FileNotFoundError as e:
@@ -333,12 +388,14 @@ def main():
 
         render_scene(
             model_path=model_path,
-            cam_calibs=cam_calibs,
-            R_w2vl=R_w2vl,
-            t_w2vl=t_w2vl,
+            vehicle_calib=args.vehicle_calib,
+            camera_ids=args.camera_ids,
+            R_w2l=R_w2l,
+            t_w2l=t_w2l,
             scene_name=scene_name,
             pipe={"pipe": pipe_args, "hyper": hyper},
             output_dir=args.output_root,
+            render_scale=args.render_scale,
             time_val=args.time,
         )
 
