@@ -177,6 +177,7 @@ def load_trained_model(model_path, iteration, hyper_args):
     sh_degree = 3
     cfg_path = os.path.join(model_path, "cfg_args")
     if os.path.exists(cfg_path):
+        from argparse import Namespace
         with open(cfg_path) as f:
             cfg = eval(f.read())
             if hasattr(cfg, 'sh_degree'):
