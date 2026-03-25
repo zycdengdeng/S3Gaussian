@@ -34,7 +34,7 @@ import glob
 import re
 import math
 from pathlib import Path
-from argparse import ArgumentParser
+from argparse import ArgumentParser, Namespace
 from tqdm import tqdm
 from scipy.spatial.transform import Rotation
 
@@ -247,13 +247,17 @@ def load_trained_model(model_path, iteration, hyper_args):
     return gaussians
 
 
+RENDER_W = 1280
+RENDER_H = 720
+
+
 def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
-                 scene_name, pipe, output_dir, render_scale=4, time_val=0.0):
-    """Render one scene from vehicle cameras at ONE timestamp."""
+                 scene_name, pipe, output_dir, time_val=0.0):
+    """Render one scene from vehicle cameras at ONE timestamp at 1280x720."""
     gaussians = load_trained_model(model_path, 30000, pipe["hyper"])
     bg_color = torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda")
 
-    print(f"Rendering {scene_name}: {len(camera_ids)} vehicle cameras")
+    print(f"Rendering {scene_name}: {len(camera_ids)} vehicle cameras at {RENDER_W}x{RENDER_H}")
 
     scene_out = os.path.join(output_dir, scene_name)
     os.makedirs(scene_out, exist_ok=True)
@@ -270,33 +274,27 @@ def render_scene(model_path, vehicle_calib, camera_ids, R_w2l, t_w2l,
         K, D, R_cam2lidar, t_cam2lidar, resolution = load_vehicle_camera(
             vehicle_calib, cam_id
         )
-        w, h = resolution
+        orig_w, orig_h = resolution
 
-        # Apply render scale
-        if render_scale != 1:
-            w = w // render_scale
-            h = h // render_scale
-
-        # Compute undistorted intrinsics
+        # Compute undistorted intrinsics at original resolution
         new_K = compute_undistorted_intrinsics(K, D, cam_id, resolution)
 
-        # Scale intrinsics
-        if render_scale != 1:
-            scale_x = w / resolution[0]
-            scale_y = h / resolution[1]
-            new_K[0, :] *= scale_x
-            new_K[1, :] *= scale_y
+        # Scale intrinsics from original resolution to 1280x720
+        scale_x = RENDER_W / orig_w
+        scale_y = RENDER_H / orig_h
+        new_K[0, :] *= scale_x
+        new_K[1, :] *= scale_y
 
         fx, fy = new_K[0, 0], new_K[1, 1]
-        fovx = focal2fov(fx, w)
-        fovy = focal2fov(fy, h)
+        fovx = focal2fov(fx, RENDER_W)
+        fovy = focal2fov(fy, RENDER_H)
 
         # Compute vehicle camera pose in world coordinates
         R_stored, T_stored = compute_vehicle_w2c(
             R_w2l, t_w2l, R_cam2lidar, t_cam2lidar
         )
 
-        cam = create_minicam(R_stored, T_stored, fovx, fovy, w, h, time_val)
+        cam = create_minicam(R_stored, T_stored, fovx, fovy, RENDER_W, RENDER_H, time_val)
 
         with torch.no_grad():
             render_pkg = render(cam, gaussians, pipe["pipe"], bg_color, stage="fine")
@@ -331,8 +329,6 @@ def main():
                         help="Render specific scene (default: all)")
     parser.add_argument("--camera_ids", type=int, nargs='+', default=[1, 5, 6, 7],
                         help="Vehicle camera IDs to render (default: 1 5 6 7, non-fisheye)")
-    parser.add_argument("--render_scale", type=int, default=4,
-                        help="Downscale factor for rendering resolution (default: 4)")
     parser.add_argument("--time", type=float, default=0.0,
                         help="Time value for deformation network (0.0 = first frame)")
 
@@ -350,11 +346,10 @@ def main():
     cam_subdir = calib_path / "camera"
     calib_base = cam_subdir if cam_subdir.is_dir() else calib_path
     print(f"Vehicle calibration: {calib_base}")
+    print(f"Render resolution: {RENDER_W}x{RENDER_H}")
     for cid in args.camera_ids:
         cam_name = VEHICLE_CAMERAS[cid]["name"]
-        res = VEHICLE_CAMERAS[cid]["resolution"]
-        w, h = res[0] // args.render_scale, res[1] // args.render_scale
-        print(f"  cam{cid} ({cam_name}): {w}x{h}")
+        print(f"  cam{cid} ({cam_name})")
 
     # Discover scenes
     if args.scene_name:
@@ -395,7 +390,6 @@ def main():
             scene_name=scene_name,
             pipe={"pipe": pipe_args, "hyper": hyper},
             output_dir=args.output_root,
-            render_scale=args.render_scale,
             time_val=args.time,
         )
 
