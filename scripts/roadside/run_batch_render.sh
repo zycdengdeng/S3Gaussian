@@ -125,7 +125,7 @@ echo ""
 
 pids=()
 for w in $(seq 0 $((PARALLEL - 1))); do
-    IFS=$'\n' read -ra wscenes <<< "${worker_lists[$w]}"
+    mapfile -t wscenes <<< "${worker_lists[$w]}"
     clean=()
     for s in "${wscenes[@]}"; do
         [ -n "$s" ] && clean+=("$s")
